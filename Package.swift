@@ -25,6 +25,7 @@ let package = Package(
                 .linkedFramework("Metal"),
                 .linkedFramework("MetalKit"),
                 .linkedFramework("MetalPerformanceShaders"),
+                .linkedFramework("CoreML"),
                 .linkedFramework("Vision"),
                 .linkedFramework("VideoToolbox"),
                 .linkedFramework("UniformTypeIdentifiers")

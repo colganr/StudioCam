@@ -24,11 +24,25 @@ public final class BackgroundMediaController {
     private var currentURL: URL?
     private var isVideoActive: Bool = false
     private var shouldPlay: Bool = false
+    private var targetDecodeDimensions: (Int, Int) = (3840, 2160)
+
+    public var onStaticImageLoaded: ((CGImage, String) -> Void)?
+    public var currentSourceToken: String {
+        lock.lock()
+        defer { lock.unlock() }
+        return currentURL?.path ?? "none"
+    }
 
     public private(set) var mediaSummary: String = "None"
 
     public init(device: MTLDevice) {
         self.device = device
+    }
+
+    public func setTargetDecodeDimensions(width: Int, height: Int) {
+        lock.lock()
+        targetDecodeDimensions = (width, height)
+        lock.unlock()
     }
 
     public static func isVideoURL(_ url: URL) -> Bool {
@@ -99,7 +113,9 @@ public final class BackgroundMediaController {
             self.isVideoActive = false
             let summary = "\(url.lastPathComponent) (\(w)×\(h) Image)"
             self.mediaSummary = summary
+            let cb = self.onStaticImageLoaded
             self.lock.unlock()
+            cb?(cgImg, url.path)
             completion?(true, summary)
         }
     }
@@ -119,12 +135,20 @@ public final class BackgroundMediaController {
                 let w = Int(abs(natSize.width))
                 let h = Int(abs(natSize.height))
 
-                // Request Media Engine NV12 IOSurface output (zero CPU conversion)
-                let outAttrs: [String: Any] = [
+                // Request Media Engine NV12 IOSurface output capped at active pipeline dimensions
+                // (so a 1080p Teams/Meet call decodes 4K videos directly to 1080p on the Media Engine hardware scaler!)
+                let maxDims = self.readTargetDecodeDimensions()
+                let decW = min(w, maxDims.0)
+                let decH = min(h, maxDims.1)
+                var outAttrs: [String: Any] = [
                     kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
                     kCVPixelBufferIOSurfacePropertiesKey as String: [:],
                     kCVPixelBufferMetalCompatibilityKey as String: true
                 ]
+                if decW > 0 && decH > 0 && (decW < w || decH < h) {
+                    outAttrs[kCVPixelBufferWidthKey as String] = decW
+                    outAttrs[kCVPixelBufferHeightKey as String] = decH
+                }
                 let output = AVPlayerItemVideoOutput(pixelBufferAttributes: outAttrs)
                 output.suppressesPlayerRendering = true
 
@@ -194,6 +218,12 @@ public final class BackgroundMediaController {
             }
         }
         return (latestVideoPixelBuffer, nil)
+    }
+
+    private func readTargetDecodeDimensions() -> (Int, Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        return targetDecodeDimensions
     }
 
     private func installNewVideoPlayer(

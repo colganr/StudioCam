@@ -1,36 +1,44 @@
 import SwiftUI
-import MetalPerformanceShaders
 import UniformTypeIdentifiers
 import AppKit
 
-/// Clean macOS Control Center Video Effects menu-bar UI with 4K Video Background support.
+/// Clean macOS Control Center-inspired Camera Studio popover with Studio Profiles,
+/// Client-Matched Resolution, ANE 3D Scene-Depth Bokeh, Optical Light Wrap, Auto-Framing,
+/// 3D .cube LUTs, Unified 35mm Grain, and Screen-Share-Invisible Lens Prompter.
 public struct ControlCenterMenuView: View {
     @ObservedObject var pipeline: StudioPipeline
     @ObservedObject var settings: StudioSettings
+    @ObservedObject var prompter: LensPrompterController
     let onToggleCleanWindow: () -> Void
 
     public init(
         pipeline: StudioPipeline,
         settings: StudioSettings,
+        prompter: LensPrompterController,
         onToggleCleanWindow: @escaping () -> Void
     ) {
         self.pipeline = pipeline
         self.settings = settings
+        self.prompter = prompter
         self.onToggleCleanWindow = onToggleCleanWindow
     }
 
     public var body: some View {
         VStack(spacing: 0) {
             headerBar
+            studioProfilesBar
             previewStage
-            cameraSelectorBar
+            cameraAndResolutionBar
             Divider().overlay(Color.white.opacity(0.08))
-            effectsStack
+            ScrollView(.vertical, showsIndicators: false) {
+                effectsStack
+            }
+            .frame(maxHeight: 340)
             Divider().overlay(Color.white.opacity(0.08))
             footerTelemetryBar
         }
-        .frame(width: 348)
-        .background(Color(nsColor: NSColor(calibratedRed: 0.11, green: 0.13, blue: 0.16, alpha: 0.96)))
+        .frame(width: 362)
+        .background(Color(nsColor: NSColor(calibratedRed: 0.11, green: 0.13, blue: 0.16, alpha: 0.97)))
         .onAppear {
             pipeline.refreshCameras()
             pipeline.isPopoverVisible = true
@@ -46,7 +54,7 @@ public struct ControlCenterMenuView: View {
     // MARK: - Top Header
 
     private var headerBar: some View {
-        HStack(spacing: 10) {
+        HStack(spacing: 9) {
             ZStack {
                 RoundedRectangle(cornerRadius: 8, style: .continuous)
                     .fill(
@@ -63,16 +71,32 @@ public struct ControlCenterMenuView: View {
             }
 
             VStack(alignment: .leading, spacing: 1) {
-                Text("StudioCam 4K")
+                Text("StudioCam")
                     .font(.system(size: 13, weight: .semibold))
                     .foregroundStyle(.white)
-                Text(pipeline.activeMediaLabel)
-                    .font(.system(size: 10))
-                    .foregroundStyle(.white.opacity(0.60))
+                Text(pipeline.resolutionTelemetry)
+                    .font(.system(size: 9.5, design: .monospaced))
+                    .foregroundStyle(.white.opacity(0.58))
                     .lineLimit(1)
             }
 
             Spacer()
+
+            // Quick Lens Prompter Toggle (Invisible to Screen Share)
+            Button {
+                prompter.isVisible.toggle()
+            } label: {
+                Image(systemName: prompter.isVisible ? "text.viewfinder" : "eye")
+                    .font(.system(size: 11.5, weight: .semibold))
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 5)
+                    .background(
+                        Capsule().fill(prompter.isVisible ? Color.cyan.opacity(0.28) : Color.white.opacity(0.09))
+                    )
+                    .foregroundStyle(prompter.isVisible ? Color.cyan : Color.white.opacity(0.82))
+            }
+            .buttonStyle(.plain)
+            .help("Toggle Under-Camera Lens Prompter (invisible to Zoom/Teams screen share)")
 
             // Zero-Cert Virtual Camera Live Pill
             Button {
@@ -93,10 +117,57 @@ public struct ControlCenterMenuView: View {
                 .foregroundStyle(settings.virtualCamEnabled ? Color.green : Color.white.opacity(0.85))
             }
             .buttonStyle(.plain)
-            .help("Broadcast zero-copy frames into OBS / Elgato Virtual Camera (no Apple Developer cert needed)")
+            .help("Broadcast zero-copy frames into OBS / Elgato Virtual Camera")
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 10)
+        .padding(.horizontal, 12)
+        .padding(.top, 10)
+        .padding(.bottom, 6)
+    }
+
+    // MARK: - One-Click Studio Profiles Bar
+
+    private var studioProfilesBar: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 6) {
+                ForEach(StudioProfilePreset.builtIns) { prof in
+                    profilePill(prof)
+                }
+                if let custom = settings.customUserProfile {
+                    profilePill(custom)
+                }
+                Button {
+                    settings.saveCurrentAsCustomProfile()
+                } label: {
+                    Label("Save", systemImage: "plus")
+                        .font(.system(size: 10, weight: .medium))
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3.5)
+                        .background(Color.white.opacity(0.07), in: Capsule())
+                        .foregroundStyle(.white.opacity(0.75))
+                }
+                .buttonStyle(.plain)
+                .help("Save current settings as My Preset")
+            }
+            .padding(.horizontal, 12)
+            .padding(.bottom, 7)
+        }
+    }
+
+    private func profilePill(_ prof: StudioProfilePreset) -> some View {
+        let active = (settings.activeProfileID == prof.id)
+        return Button {
+            pipeline.applyStudioProfile(prof)
+        } label: {
+            Text(prof.name)
+                .font(.system(size: 10.5, weight: active ? .semibold : .medium))
+                .padding(.horizontal, 9)
+                .padding(.vertical, 3.5)
+                .background(
+                    Capsule().fill(active ? Color.accentColor.opacity(0.85) : Color.white.opacity(0.09))
+                )
+                .foregroundStyle(.white)
+        }
+        .buttonStyle(.plain)
     }
 
     // MARK: - 16:9 Live Metal Preview Stage
@@ -110,7 +181,7 @@ public struct ControlCenterMenuView: View {
                     pipeline.onFrameRendered = handler
                 }
             )
-            .frame(width: 348, height: 196)
+            .frame(width: 362, height: 204)
             .background(Color.black)
 
             if settings.isDropTargeted {
@@ -118,7 +189,7 @@ public struct ControlCenterMenuView: View {
                     .strokeBorder(Color.cyan, style: StrokeStyle(lineWidth: 2, dash: [6]))
                     .background(Color.black.opacity(0.55))
                     .overlay(
-                        Label("Drop 4K Video, Image, or .cube LUT", systemImage: "film.stack")
+                        Label("Drop Video, Room Image, or .cube LUT", systemImage: "film.stack")
                             .font(.system(size: 12, weight: .semibold))
                             .foregroundStyle(.white)
                     )
@@ -146,7 +217,7 @@ public struct ControlCenterMenuView: View {
                         .background(.ultraThinMaterial, in: Circle())
                 }
                 .buttonStyle(.plain)
-                .help("Open 4K Clean Feed Window")
+                .help("Open Clean Feed Window")
 
                 Button {
                     pipeline.toggleRecording()
@@ -165,16 +236,16 @@ public struct ControlCenterMenuView: View {
                     .background(.ultraThinMaterial, in: Capsule())
                 }
                 .buttonStyle(.plain)
-                .help("Record Hardware 4K HEVC to ~/Movies")
+                .help("Record Hardware HEVC to ~/Movies")
             }
             .foregroundStyle(.white)
             .padding(8)
         }
     }
 
-    // MARK: - Camera & Resolution Picker Row
+    // MARK: - Camera & Client-Matched Resolution Row
 
-    private var cameraSelectorBar: some View {
+    private var cameraAndResolutionBar: some View {
         HStack(spacing: 8) {
             Menu {
                 ForEach(pipeline.cameras) { cam in
@@ -195,7 +266,7 @@ public struct ControlCenterMenuView: View {
                 HStack(spacing: 5) {
                     Text(currentCameraName)
                         .font(.system(size: 12, weight: .medium))
-                        .foregroundStyle(.white.opacity(0.85))
+                        .foregroundStyle(.white.opacity(0.88))
                         .lineLimit(1)
                     Image(systemName: "chevron.down")
                         .font(.system(size: 10, weight: .semibold))
@@ -207,17 +278,19 @@ public struct ControlCenterMenuView: View {
             Spacer()
 
             Picker("", selection: $settings.resolution) {
-                Text("4K").tag(CaptureResolutionPreset.uhd4K)
-                Text("1080p").tag(CaptureResolutionPreset.fhd1080)
+                ForEach(CaptureResolutionPreset.allCases) { p in
+                    Text(p.shortLabel).tag(p)
+                }
             }
             .pickerStyle(.segmented)
-            .frame(width: 104)
+            .frame(width: 142)
             .controlSize(.small)
+            .help("Auto matches the active resolution requested by Teams/Meet/Zoom (e.g. 1080p) without wasted 4K downsampling")
             .onChange(of: settings.resolution) { _, _ in
                 pipeline.applyResolutionChange()
             }
         }
-        .padding(.horizontal, 14)
+        .padding(.horizontal, 12)
         .padding(.vertical, 8)
     }
 
@@ -225,30 +298,82 @@ public struct ControlCenterMenuView: View {
         pipeline.cameras.first(where: { $0.id == settings.selectedCameraUniqueID })?.name ?? "Select Camera"
     }
 
-    // MARK: - 5 Control Center Feature Rows
+    // MARK: - Studio Feature Stack
 
     private var effectsStack: some View {
         VStack(spacing: 2) {
-            // 1. Portrait
+            // 1. Portrait + ANE 3D Hallway/Room Depth Bokeh
             effectRow(
                 id: "portrait",
                 icon: "f.cursive",
-                title: "Portrait",
+                title: "Portrait & 3D Depth",
                 isActive: settings.portraitEnabled,
+                trailingAccessory: AnyView(
+                    Text(settings.depthBokehEnabled ? "3D f/\(String(format: "%.1f", 4.0 - 2.8 * settings.portraitStrength))" : "Flat")
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundStyle(settings.portraitEnabled ? Color.cyan : Color.white.opacity(0.4))
+                ),
                 onToggle: { settings.portraitEnabled.toggle() }
             ) {
                 VStack(alignment: .leading, spacing: 6) {
+                    Toggle("3D Scene-Depth Bokeh (Real & Virtual Rooms)", isOn: $settings.depthBokehEnabled)
+                        .toggleStyle(.checkbox)
+                        .font(.system(size: 11))
+                        .foregroundStyle(.white.opacity(0.88))
                     HStack {
-                        Text("Depth Bokeh")
-                            .font(.system(size: 11))
+                        Text("Aperture")
+                            .font(.system(size: 10.5))
                             .foregroundStyle(.white.opacity(0.65))
+                            .frame(width: 66, alignment: .leading)
                         Slider(value: $settings.portraitStrength, in: 0.1...1.0)
                             .controlSize(.small)
+                    }
+                    if settings.depthBokehEnabled {
+                        HStack {
+                            Text("Near Focus")
+                                .font(.system(size: 10.5))
+                                .foregroundStyle(.white.opacity(0.65))
+                                .frame(width: 66, alignment: .leading)
+                            Slider(value: $settings.focalPlaneOffset, in: 0.0...0.55)
+                                .controlSize(.small)
+                        }
+                        Text(pipeline.depthAnalyzer.statusLabel)
+                            .font(.system(size: 9.5, design: .monospaced))
+                            .foregroundStyle(.white.opacity(0.5))
                     }
                 }
             }
 
-            // 2. Studio Light
+            // 2. Lossless Auto-Framing ("Center Stage" with Tripod Damper)
+            effectRow(
+                id: "autoframe",
+                icon: "person.crop.rectangle",
+                title: "Auto-Framing",
+                isActive: settings.autoFramingEnabled,
+                onToggle: {
+                    settings.autoFramingEnabled.toggle()
+                    pipeline.reconfigureCaptureInput()
+                }
+            ) {
+                VStack(alignment: .leading, spacing: 5) {
+                    HStack {
+                        Text("Framing Zoom")
+                            .font(.system(size: 10.5))
+                            .foregroundStyle(.white.opacity(0.65))
+                            .frame(width: 76, alignment: .leading)
+                        Slider(value: $settings.autoFramingZoom, in: 1.08...1.65)
+                            .controlSize(.small)
+                        Text(String(format: "%.2f×", settings.autoFramingZoom))
+                            .font(.system(size: 10, design: .monospaced))
+                            .foregroundStyle(.white.opacity(0.65))
+                    }
+                    Text("Uses 4K sensor crop headroom + tripod dead-zone damping.")
+                        .font(.system(size: 9.5))
+                        .foregroundStyle(.white.opacity(0.48))
+                }
+            }
+
+            // 3. Studio Light
             effectRow(
                 id: "studiolight",
                 icon: "cube",
@@ -258,14 +383,14 @@ public struct ControlCenterMenuView: View {
             ) {
                 HStack {
                     Text("Contour & Dim")
-                        .font(.system(size: 11))
+                        .font(.system(size: 10.5))
                         .foregroundStyle(.white.opacity(0.65))
                     Slider(value: $settings.studioLightStrength, in: 0.1...1.0)
                         .controlSize(.small)
                 }
             }
 
-            // 3. Edge Light (Shader + Physical Screen Ring Light)
+            // 4. Edge Light
             effectRow(
                 id: "edgelight",
                 icon: "sun.max.circle",
@@ -281,12 +406,10 @@ public struct ControlCenterMenuView: View {
                         .toggleStyle(.checkbox)
                         .font(.system(size: 11))
                         .foregroundStyle(.white.opacity(0.85))
-                        .onChange(of: settings.screenRingLightEnabled) { _, _ in
-                            pipeline.syncEdgeLightOverlay()
-                        }
+                        .onChange(of: settings.screenRingLightEnabled) { _, _ in pipeline.syncEdgeLightOverlay() }
                     HStack {
                         Text("Brightness")
-                            .font(.system(size: 11))
+                            .font(.system(size: 10.5))
                             .foregroundStyle(.white.opacity(0.65))
                             .frame(width: 62, alignment: .leading)
                         Slider(value: $settings.edgeLightStrength, in: 0.1...1.0)
@@ -295,7 +418,7 @@ public struct ControlCenterMenuView: View {
                     }
                     HStack {
                         Text("Warmth")
-                            .font(.system(size: 11))
+                            .font(.system(size: 10.5))
                             .foregroundStyle(.white.opacity(0.65))
                             .frame(width: 62, alignment: .leading)
                         Slider(value: $settings.edgeLightWarmth, in: 0.0...1.0)
@@ -305,33 +428,11 @@ public struct ControlCenterMenuView: View {
                 }
             }
 
-            // 4. Reactions
-            effectRow(
-                id: "reactions",
-                icon: "plus.magnifyingglass",
-                title: "Reactions",
-                isActive: settings.reactionsGestureEnabled,
-                onToggle: { settings.reactionsGestureEnabled.toggle() }
-            ) {
-                VStack(alignment: .leading, spacing: 6) {
-                    HStack(spacing: 8) {
-                        reactionTriggerButton("👍 Burst", type: 1)
-                        reactionTriggerButton("❤️ Heart", type: 2)
-                        reactionTriggerButton("🎉 Confetti", type: 3)
-                        reactionTriggerButton("⚡ Lasers", type: 4)
-                    }
-                    Toggle("Enable Hand Gesture Detection (👍 / ✌️)", isOn: $settings.reactionsGestureEnabled)
-                        .toggleStyle(.checkbox)
-                        .font(.system(size: 10.5))
-                        .foregroundStyle(.white.opacity(0.7))
-                }
-            }
-
-            // 5. Background (with 4K Video + Image + Gradient Picker!)
+            // 5. Background + Optical Light Wrap + Live Room Ambient Match
             effectRow(
                 id: "background",
                 icon: "person.and.background.dotted",
-                title: "Background",
+                title: "Background & Wrap",
                 isActive: settings.backgroundMode != .none,
                 trailingAccessory: AnyView(backgroundSwatchPreview),
                 onToggle: {
@@ -343,6 +444,7 @@ public struct ControlCenterMenuView: View {
                         }
                     } else {
                         settings.backgroundMode = .none
+                        pipeline.depthAnalyzer.invalidateSceneCache()
                         pipeline.updatePowerState()
                     }
                 }
@@ -350,106 +452,61 @@ public struct ControlCenterMenuView: View {
                 backgroundExpandedControls
             }
 
-            // 6. Whole-Composite 3D Color LUT (.cube)
+            // 6. Color LUT + Unified 35mm Film Grain + Skin Polish
             effectRow(
                 id: "lut",
                 icon: "camera.filters",
-                title: "Color LUT",
-                isActive: settings.lutEnabled,
+                title: "Color LUT & Film",
+                isActive: settings.lutEnabled || settings.filmGrainStrength > 0.02,
                 trailingAccessory: AnyView(lutBadgeView),
-                onToggle: {
-                    pipeline.toggleLUT()
-                }
+                onToggle: { pipeline.toggleLUT() }
             ) {
-                lutExpandedControls
+                lutAndFilmExpandedControls
+            }
+
+            // 7. Lens Prompter & Reactions
+            effectRow(
+                id: "prompter",
+                icon: "text.viewfinder",
+                title: "Prompter & Reactions",
+                isActive: prompter.isVisible || settings.reactionsGestureEnabled,
+                onToggle: { prompter.isVisible.toggle() }
+            ) {
+                VStack(alignment: .leading, spacing: 6) {
+                    Toggle("Show Invisible-to-Screen-Share Lens Prompter", isOn: $prompter.isVisible)
+                        .toggleStyle(.checkbox)
+                        .font(.system(size: 11))
+                        .foregroundStyle(.white.opacity(0.88))
+                    if prompter.isVisible {
+                        HStack {
+                            Text("Scroll Speed")
+                                .font(.system(size: 10.5))
+                                .foregroundStyle(.white.opacity(0.65))
+                                .frame(width: 72, alignment: .leading)
+                            Slider(value: $prompter.scrollSpeedPtsPerSec, in: 8...65)
+                                .controlSize(.mini)
+                            Text("Font")
+                                .font(.system(size: 10.5))
+                                .foregroundStyle(.white.opacity(0.65))
+                            Slider(value: $prompter.fontSize, in: 12...26)
+                                .controlSize(.mini)
+                        }
+                    }
+                    HStack(spacing: 8) {
+                        reactionTriggerButton("👍 Burst", type: 1)
+                        reactionTriggerButton("❤️ Heart", type: 2)
+                        reactionTriggerButton("🎉 Confetti", type: 3)
+                        reactionTriggerButton("⚡ Lasers", type: 4)
+                    }
+                    Toggle("Hand Gesture Reactions (👍 / ✌️)", isOn: $settings.reactionsGestureEnabled)
+                        .toggleStyle(.checkbox)
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(.white.opacity(0.7))
+                }
             }
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 6)
-    }
-
-    private var lutBadgeView: some View {
-        Text(settings.lutEnabled ? (settings.selectedLUTURL?.deletingPathExtension().lastPathComponent.replacingOccurrences(of: "_", with: " ") ?? "Active") : "Off")
-            .font(.system(size: 10, weight: .medium))
-            .lineLimit(1)
-            .frame(maxWidth: 110, alignment: .trailing)
-            .foregroundStyle(settings.lutEnabled ? Color.cyan : Color.white.opacity(0.45))
-    }
-
-    private var lutExpandedControls: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 6) {
-                Button {
-                    openLUTFilePicker()
-                } label: {
-                    Label("Choose .cube 3D LUT…", systemImage: "cube.transparent")
-                        .font(.system(size: 11.5, weight: .medium))
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 5)
-                        .background(Color.accentColor.opacity(0.85), in: RoundedRectangle(cornerRadius: 6))
-                        .foregroundStyle(.white)
-                }
-                .buttonStyle(.plain)
-
-                if settings.lutEnabled {
-                    Button("Off") {
-                        settings.lutEnabled = false
-                    }
-                    .font(.system(size: 11))
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 5)
-                    .background(Color.white.opacity(0.10), in: RoundedRectangle(cornerRadius: 6))
-                    .foregroundStyle(.white.opacity(0.8))
-                    .buttonStyle(.plain)
-                }
-            }
-
-            if !settings.recentLUTURLs.isEmpty {
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 6) {
-                        ForEach(settings.recentLUTURLs, id: \.path) { url in
-                            let selected = settings.lutEnabled && (settings.selectedLUTURL?.path == url.path)
-                            Button {
-                                pipeline.selectLUT(url: url)
-                            } label: {
-                                HStack(spacing: 4) {
-                                    Image(systemName: "camera.filters")
-                                        .font(.system(size: 9))
-                                    Text(url.deletingPathExtension().lastPathComponent.replacingOccurrences(of: "_", with: " "))
-                                        .font(.system(size: 10.5, weight: .medium))
-                                        .lineLimit(1)
-                                }
-                                .padding(.horizontal, 8)
-                                .padding(.vertical, 4)
-                                .background(
-                                    RoundedRectangle(cornerRadius: 5)
-                                        .fill(selected ? Color.cyan.opacity(0.30) : Color.white.opacity(0.08))
-                                )
-                                .overlay(
-                                    RoundedRectangle(cornerRadius: 5)
-                                        .stroke(selected ? Color.cyan : Color.clear, lineWidth: 1)
-                                )
-                                .foregroundStyle(.white)
-                            }
-                            .buttonStyle(.plain)
-                        }
-                    }
-                }
-            }
-
-            HStack {
-                Text("Intensity")
-                    .font(.system(size: 10.5))
-                    .foregroundStyle(.white.opacity(0.65))
-                    .frame(width: 58, alignment: .leading)
-                Slider(value: $settings.lutStrength, in: 0.0...1.0)
-                    .controlSize(.small)
-                Text("\(Int(settings.lutStrength * 100))%")
-                    .font(.system(size: 10, design: .monospaced))
-                    .foregroundStyle(.white.opacity(0.65))
-                    .frame(width: 32, alignment: .trailing)
-            }
-        }
     }
 
     private var backgroundSwatchPreview: some View {
@@ -468,13 +525,9 @@ public struct ControlCenterMenuView: View {
             .overlay(
                 Group {
                     if settings.backgroundMode == .video {
-                        Image(systemName: "play.fill")
-                            .font(.system(size: 9, weight: .bold))
-                            .foregroundStyle(.white)
+                        Image(systemName: "play.fill").font(.system(size: 9, weight: .bold)).foregroundStyle(.white)
                     } else if settings.backgroundMode == .image {
-                        Image(systemName: "photo.fill")
-                            .font(.system(size: 9, weight: .bold))
-                            .foregroundStyle(.white)
+                        Image(systemName: "photo.fill").font(.system(size: 9, weight: .bold)).foregroundStyle(.white)
                     }
                 }
             )
@@ -483,13 +536,10 @@ public struct ControlCenterMenuView: View {
     }
 
     private var backgroundExpandedControls: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            // Choose 4K Video or Image Button
+        VStack(alignment: .leading, spacing: 7) {
             HStack(spacing: 6) {
-                Button {
-                    openMediaFilePicker()
-                } label: {
-                    Label("Choose 4K Video / Image…", systemImage: "film")
+                Button { openMediaFilePicker() } label: {
+                    Label("Choose Video / Room Image…", systemImage: "film")
                         .font(.system(size: 11.5, weight: .medium))
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 5)
@@ -501,6 +551,7 @@ public struct ControlCenterMenuView: View {
                 if settings.backgroundMode != .none {
                     Button("Off") {
                         settings.backgroundMode = .none
+                        pipeline.depthAnalyzer.invalidateSceneCache()
                         pipeline.updatePowerState()
                     }
                     .font(.system(size: 11))
@@ -512,33 +563,23 @@ public struct ControlCenterMenuView: View {
                 }
             }
 
-            // Recent / Sample 4K Videos & Images
             if !settings.recentBackgroundURLs.isEmpty {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 6) {
                         ForEach(settings.recentBackgroundURLs, id: \.path) { url in
                             let isVid = BackgroundMediaController.isVideoURL(url)
                             let selected = (settings.customBackgroundURL?.path == url.path) && (settings.backgroundMode == .video || settings.backgroundMode == .image)
-                            Button {
-                                pipeline.selectCustomBackground(url: url)
-                            } label: {
+                            Button { pipeline.selectCustomBackground(url: url) } label: {
                                 HStack(spacing: 4) {
-                                    Image(systemName: isVid ? "video.fill" : "photo")
-                                        .font(.system(size: 9))
+                                    Image(systemName: isVid ? "video.fill" : "photo").font(.system(size: 9))
                                     Text(url.deletingPathExtension().lastPathComponent)
                                         .font(.system(size: 10.5, weight: .medium))
                                         .lineLimit(1)
                                 }
                                 .padding(.horizontal, 8)
                                 .padding(.vertical, 4)
-                                .background(
-                                    RoundedRectangle(cornerRadius: 5)
-                                        .fill(selected ? Color.cyan.opacity(0.30) : Color.white.opacity(0.08))
-                                )
-                                .overlay(
-                                    RoundedRectangle(cornerRadius: 5)
-                                        .stroke(selected ? Color.cyan : Color.clear, lineWidth: 1)
-                                )
+                                .background(RoundedRectangle(cornerRadius: 5).fill(selected ? Color.cyan.opacity(0.30) : Color.white.opacity(0.08)))
+                                .overlay(RoundedRectangle(cornerRadius: 5).stroke(selected ? Color.cyan : Color.clear, lineWidth: 1))
                                 .foregroundStyle(.white)
                             }
                             .buttonStyle(.plain)
@@ -547,13 +588,10 @@ public struct ControlCenterMenuView: View {
                 }
             }
 
-            // Studio Gradients Strip
             HStack(spacing: 7) {
                 ForEach(StudioGradientPreset.presets) { preset in
                     let isSel = (settings.backgroundMode == .gradient && settings.selectedGradientID == preset.id)
-                    Button {
-                        pipeline.selectGradientPreset(preset)
-                    } label: {
+                    Button { pipeline.selectGradientPreset(preset) } label: {
                         RoundedRectangle(cornerRadius: 5)
                             .fill(
                                 LinearGradient(
@@ -565,23 +603,34 @@ public struct ControlCenterMenuView: View {
                                     endPoint: .bottom
                                 )
                             )
-                            .frame(width: 36, height: 22)
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 5)
-                                    .stroke(isSel ? Color.white : Color.white.opacity(0.18), lineWidth: isSel ? 2 : 1)
-                            )
+                            .frame(width: 36, height: 20)
+                            .overlay(RoundedRectangle(cornerRadius: 5).stroke(isSel ? Color.white : Color.white.opacity(0.18), lineWidth: isSel ? 2 : 1))
                     }
                     .buttonStyle(.plain)
                     .help(preset.name)
                 }
             }
 
-            // Matte Quality & Hair Spill Suppression Controls
+            // Optical Light Wrap + Live Room Color Match
+            HStack {
+                Text("Light Wrap")
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.white.opacity(0.65))
+                    .frame(width: 62, alignment: .leading)
+                Slider(value: $settings.lightWrapStrength, in: 0.0...1.0)
+                    .controlSize(.mini)
+                Text("Color Match")
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.white.opacity(0.65))
+                Slider(value: $settings.ambientMatchStrength, in: 0.0...1.0)
+                    .controlSize(.mini)
+            }
+
             HStack {
                 Text("Hair Spill")
                     .font(.system(size: 10.5))
                     .foregroundStyle(.white.opacity(0.65))
-                    .frame(width: 58, alignment: .leading)
+                    .frame(width: 62, alignment: .leading)
                 Slider(value: $settings.spillSuppression, in: 0.0...1.0)
                     .controlSize(.mini)
                 Text("Feather")
@@ -590,22 +639,96 @@ public struct ControlCenterMenuView: View {
                 Slider(value: $settings.edgeSoftness, in: 0.05...0.95)
                     .controlSize(.mini)
             }
+        }
+    }
 
-            Picker("Matte Engine", selection: $settings.segmentationQuality) {
-                ForEach(SegmentationQualityPreset.allCases) { q in
-                    Text(q.title).tag(q)
+    private var lutBadgeView: some View {
+        Text(settings.lutEnabled ? (settings.selectedLUTURL?.deletingPathExtension().lastPathComponent.replacingOccurrences(of: "_", with: " ") ?? "Active") : "Off")
+            .font(.system(size: 10, weight: .medium))
+            .lineLimit(1)
+            .frame(maxWidth: 110, alignment: .trailing)
+            .foregroundStyle(settings.lutEnabled ? Color.cyan : Color.white.opacity(0.45))
+    }
+
+    private var lutAndFilmExpandedControls: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(spacing: 6) {
+                Button { openLUTFilePicker() } label: {
+                    Label("Choose .cube 3D LUT…", systemImage: "cube.transparent")
+                        .font(.system(size: 11.5, weight: .medium))
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 5)
+                        .background(Color.accentColor.opacity(0.85), in: RoundedRectangle(cornerRadius: 6))
+                        .foregroundStyle(.white)
+                }
+                .buttonStyle(.plain)
+
+                if settings.lutEnabled {
+                    Button("LUT Off") { settings.lutEnabled = false }
+                        .font(.system(size: 11))
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 5)
+                        .background(Color.white.opacity(0.10), in: RoundedRectangle(cornerRadius: 6))
+                        .foregroundStyle(.white.opacity(0.8))
+                        .buttonStyle(.plain)
                 }
             }
-            .font(.system(size: 10.5))
-            .controlSize(.mini)
-            .foregroundStyle(.white.opacity(0.75))
+
+            if !settings.recentLUTURLs.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 6) {
+                        ForEach(settings.recentLUTURLs, id: \.path) { url in
+                            let selected = settings.lutEnabled && (settings.selectedLUTURL?.path == url.path)
+                            Button { pipeline.selectLUT(url: url) } label: {
+                                HStack(spacing: 4) {
+                                    Image(systemName: "camera.filters").font(.system(size: 9))
+                                    Text(url.deletingPathExtension().lastPathComponent.replacingOccurrences(of: "_", with: " "))
+                                        .font(.system(size: 10.5, weight: .medium))
+                                        .lineLimit(1)
+                                }
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 4)
+                                .background(RoundedRectangle(cornerRadius: 5).fill(selected ? Color.cyan.opacity(0.30) : Color.white.opacity(0.08)))
+                                .overlay(RoundedRectangle(cornerRadius: 5).stroke(selected ? Color.cyan : Color.clear, lineWidth: 1))
+                                .foregroundStyle(.white)
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                }
+            }
+
+            HStack {
+                Text("LUT Mix")
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.white.opacity(0.65))
+                    .frame(width: 62, alignment: .leading)
+                Slider(value: $settings.lutStrength, in: 0.0...1.0)
+                    .controlSize(.mini)
+                Text("\(Int(settings.lutStrength * 100))%")
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(.white.opacity(0.65))
+                    .frame(width: 32, alignment: .trailing)
+            }
+
+            HStack {
+                Text("35mm Grain")
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.white.opacity(0.65))
+                    .frame(width: 62, alignment: .leading)
+                Slider(value: $settings.filmGrainStrength, in: 0.0...0.65)
+                    .controlSize(.mini)
+                Text("Skin Soft")
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.white.opacity(0.65))
+                Slider(value: $settings.skinPolishStrength, in: 0.0...0.85)
+                    .controlSize(.mini)
+            }
         }
     }
 
     private func reactionTriggerButton(_ label: String, type: UInt32) -> some View {
-        Button {
-            settings.triggerReaction(type)
-        } label: {
+        Button { settings.triggerReaction(type) } label: {
             Text(label)
                 .font(.system(size: 10.5, weight: .medium))
                 .padding(.horizontal, 7)
@@ -632,27 +755,25 @@ public struct ControlCenterMenuView: View {
                     ZStack {
                         Circle()
                             .fill(isActive ? Color.accentColor : Color.white.opacity(0.12))
-                            .frame(width: 28, height: 28)
+                            .frame(width: 27, height: 27)
                         Image(systemName: icon)
-                            .font(.system(size: 13, weight: .semibold))
+                            .font(.system(size: 12.5, weight: .semibold))
                             .foregroundStyle(isActive ? Color.white : Color.white.opacity(0.82))
                     }
                 }
                 .buttonStyle(.plain)
 
                 Button {
-                    withAnimation(.easeInOut(duration: 0.15)) {
+                    withAnimation(.easeInOut(duration: 0.14)) {
                         settings.expandedRow = isExpanded ? nil : id
                     }
                 } label: {
                     HStack {
                         Text(title)
-                            .font(.system(size: 13, weight: .medium))
+                            .font(.system(size: 12.5, weight: .medium))
                             .foregroundStyle(.white)
                         Spacer()
-                        if let acc = trailingAccessory {
-                            acc
-                        }
+                        if let acc = trailingAccessory { acc }
                         Image(systemName: isExpanded ? "chevron.up" : "chevron.right")
                             .font(.system(size: 10, weight: .semibold))
                             .foregroundStyle(.white.opacity(0.42))
@@ -662,7 +783,7 @@ public struct ControlCenterMenuView: View {
                 .buttonStyle(.plain)
             }
             .padding(.horizontal, 6)
-            .padding(.vertical, 4)
+            .padding(.vertical, 3.5)
 
             if isExpanded {
                 details()
@@ -676,7 +797,7 @@ public struct ControlCenterMenuView: View {
         )
     }
 
-    // MARK: - Footer Hardware Telemetry + Quit
+    // MARK: - Footer Hardware Telemetry
 
     private var footerTelemetryBar: some View {
         HStack(spacing: 8) {
@@ -700,14 +821,14 @@ public struct ControlCenterMenuView: View {
             .buttonStyle(.plain)
         }
         .padding(.horizontal, 14)
-        .padding(.vertical, 8)
+        .padding(.vertical, 7)
     }
 
-    // MARK: - Native macOS File Picker & Drag-Drop
+    // MARK: - Pickers & Drag-Drop
 
     private func openMediaFilePicker() {
         let panel = NSOpenPanel()
-        panel.title = "Choose 4K Video or Image Background"
+        panel.title = "Choose Video or Room Image Background"
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
         panel.allowsMultipleSelection = false

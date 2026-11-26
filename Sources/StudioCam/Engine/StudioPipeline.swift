@@ -4,6 +4,7 @@ import Vision
 import Metal
 import CoreVideo
 import CoreMedia
+import QuartzCore
 import AppKit
 import simd
 
@@ -14,6 +15,7 @@ public struct CameraDeviceOption: Identifiable, Equatable {
 
 public final class StudioPipeline: NSObject, ObservableObject, @unchecked Sendable {
     public let settings: StudioSettings
+    @MainActor public let prompter: LensPrompterController
 
     @Published public private(set) var cameras: [CameraDeviceOption] = []
     @Published public private(set) var isPipelineRunning: Bool = false
@@ -26,16 +28,15 @@ public final class StudioPipeline: NSObject, ObservableObject, @unchecked Sendab
     @Published public private(set) var aneMsTelemetry: Double = 0
     @Published public private(set) var resolutionTelemetry: String = "Idle (0% CPU/GPU)"
 
-    // Consumer tracking for Zero-Idle Power Management
     @MainActor public var isPopoverVisible: Bool = false { didSet { updatePowerState() } }
     @MainActor public var isCleanWindowVisible: Bool = false { didSet { updatePowerState() } }
 
     public let compositor: MetalStudioCompositor
     public let bgMedia: BackgroundMediaController
+    public let depthAnalyzer: SceneDepthAnalyzer
     public let sinkBridge = CMIOSinkBridge()
     private let ringLight: ScreenRingLightController
 
-    // Preview callback (fires on render queue for zero-CPU MTKView redraws)
     private let frameCallbackLock = NSLock()
     private var _onFrameRendered: ((MTLTexture) -> Void)?
     public var onFrameRendered: ((MTLTexture) -> Void)? {
@@ -47,7 +48,8 @@ public final class StudioPipeline: NSObject, ObservableObject, @unchecked Sendab
     private let captureSession = AVCaptureSession()
     private let videoDataOutput = AVCaptureVideoDataOutput()
     private var activeDeviceInput: AVCaptureDeviceInput?
-    private var configuredPresetResolution: CaptureResolutionPreset?
+    private var configuredDimensions: (Int, Int) = (0, 0)
+    private var configuredSensorHeadroom: Bool = false
 
     // Vision ANE state (isolated to captureQueue)
     private let visionSequenceHandler = VNSequenceRequestHandler()
@@ -59,13 +61,18 @@ public final class StudioPipeline: NSObject, ObservableObject, @unchecked Sendab
     private var frameIndex: UInt64 = 0
     private var lastReactionCooldownTime: TimeInterval = 0
 
-    // FPS & ANE timing state
+    // Dead-zone tripod spring damper for Lossless Cinema Auto-Framing ("Center Stage")
+    private var tripodAnchorCenter = SIMD2<Float>(0.5, 0.44)
+    private var smoothedCropCenter = SIMD2<Float>(0.5, 0.5)
+    private var smoothedCropScale: Float = 1.0
+
+    // FPS & ANE timing
     private var lastFrameTimestamp: CFTimeInterval = 0
     private var smoothedFPS: Double = 0
     private var smoothedANEMs: Double = 0
     private var lastUIStatsPush: CFTimeInterval = 0
 
-    // Optional 4K HEVC hardware recorder
+    // Hardware HEVC recorder
     private let recorderLock = NSLock()
     private var assetWriter: AVAssetWriter?
     private var writerInput: AVAssetWriterInput?
@@ -75,15 +82,33 @@ public final class StudioPipeline: NSObject, ObservableObject, @unchecked Sendab
     @MainActor
     public init(settings: StudioSettings) throws {
         self.settings = settings
+        self.prompter = LensPrompterController()
         let shaderSrc = Self.loadShaderFallbackSource()
         self.compositor = try MetalStudioCompositor(shaderSourceFallback: shaderSrc)
         self.bgMedia = BackgroundMediaController(device: compositor.device)
+        self.depthAnalyzer = SceneDepthAnalyzer(device: compositor.device)
         self.ringLight = ScreenRingLightController()
         super.init()
 
         segRequest.qualityLevel = .balanced
         segRequest.outputPixelFormat = kCVPixelFormatType_OneComponent8
         handRequest.maximumHandCount = 2
+
+        // Analyze depth immediately whenever a static virtual room background image loads!
+        bgMedia.onStaticImageLoaded = { [weak self] cgImage, token in
+            self?.depthAnalyzer.analyzeStaticBackground(cgImage: cgImage, token: "img:\(token)")
+        }
+
+        // Dynamically adapt pipeline resolution if downstream app (Teams/Meet/Zoom/OBS) changes active CMIO format!
+        sinkBridge.onActiveFormatChanged = { [weak self] dims in
+            Task { @MainActor in
+                guard let self = self else { return }
+                self.virtualCamStatus = "Live (\(dims.0)×\(dims.1))"
+                if self.settings.resolution == .autoClient {
+                    self.reconfigureCaptureInput()
+                }
+            }
+        }
 
         refreshCameras()
         restoreCustomBackgroundIfNeeded()
@@ -94,9 +119,7 @@ public final class StudioPipeline: NSObject, ObservableObject, @unchecked Sendab
     private func observeCameraHotplugNotifications() {
         let nc = NotificationCenter.default
         nc.addObserver(forName: .AVCaptureDeviceWasConnected, object: nil, queue: .main) { [weak self] _ in
-            Task { @MainActor in
-                self?.refreshCameras()
-            }
+            Task { @MainActor in self?.refreshCameras() }
         }
         nc.addObserver(forName: .AVCaptureDeviceWasDisconnected, object: nil, queue: .main) { [weak self] note in
             let removedID = (note.object as? AVCaptureDevice)?.uniqueID
@@ -104,10 +127,7 @@ public final class StudioPipeline: NSObject, ObservableObject, @unchecked Sendab
                 guard let self = self else { return }
                 let wasActive = (removedID != nil && removedID == self.settings.selectedCameraUniqueID)
                 self.refreshCameras()
-                if wasActive {
-                    // Seamless auto-failover (e.g. USB webcam unplugged -> built-in MacBook FaceTime HD Camera)
-                    self.reconfigureCaptureInput()
-                }
+                if wasActive { self.reconfigureCaptureInput() }
             }
         }
     }
@@ -128,6 +148,12 @@ public final class StudioPipeline: NSObject, ObservableObject, @unchecked Sendab
         return ""
     }
 
+    /// Computes exact target pipeline dimensions without wasted 4K->1080p downsampling.
+    public nonisolated func resolvePipelineDimensions(for snap: RenderSettingsSnapshot) -> (width: Int, height: Int) {
+        let clientHint: (Int, Int)? = snap.virtualCamEnabled ? sinkBridge.activeDimensions : (1920, 1080)
+        return snap.resolution.resolvedDimensions(clientHint: clientHint)
+    }
+
     @MainActor
     public func refreshCameras() {
         var types: [AVCaptureDevice.DeviceType] = [.external, .builtInWideAngleCamera, .continuityCamera]
@@ -139,7 +165,6 @@ public final class StudioPipeline: NSObject, ObservableObject, @unchecked Sendab
             mediaType: .video,
             position: .unspecified
         )
-        // Exclude virtual cameras so we never create a feedback loop
         let physical = discovery.devices.filter { dev in
             let n = dev.localizedName.lowercased()
             return !n.contains("virtual") && !n.contains("studiocam")
@@ -147,7 +172,6 @@ public final class StudioPipeline: NSObject, ObservableObject, @unchecked Sendab
         self.cameras = physical.map { CameraDeviceOption(id: $0.uniqueID, name: $0.localizedName) }
 
         if settings.selectedCameraUniqueID.isEmpty || !cameras.contains(where: { $0.id == settings.selectedCameraUniqueID }) {
-            // Prefer Elgato Facecam 4K automatically if attached
             if let facecam = cameras.first(where: { $0.name.localizedCaseInsensitiveContains("Facecam") }) {
                 settings.selectedCameraUniqueID = facecam.id
             } else if let first = cameras.first {
@@ -157,14 +181,57 @@ public final class StudioPipeline: NSObject, ObservableObject, @unchecked Sendab
     }
 
     @MainActor
+    public func applyStudioProfile(_ profile: StudioProfilePreset) {
+        settings.activeProfileID = profile.id
+        settings.resolution = profile.resolution
+        settings.portraitEnabled = profile.portraitEnabled
+        settings.portraitStrength = profile.portraitStrength
+        settings.depthBokehEnabled = profile.depthBokehEnabled
+        settings.focalPlaneOffset = profile.focalPlaneOffset
+        settings.studioLightEnabled = profile.studioLightEnabled
+        settings.studioLightStrength = profile.studioLightStrength
+        settings.edgeLightEnabled = profile.edgeLightEnabled
+        settings.lightWrapStrength = profile.lightWrapStrength
+        settings.ambientMatchStrength = profile.ambientMatchStrength
+        settings.autoFramingEnabled = profile.autoFramingEnabled
+        settings.skinPolishStrength = profile.skinPolishStrength
+        settings.filmGrainStrength = profile.filmGrainStrength
+
+        if profile.backgroundMode == .none {
+            settings.backgroundMode = .none
+            activeMediaLabel = "Real Room + Hallway Depth"
+            depthAnalyzer.invalidateSceneCache()
+        } else if profile.backgroundMode == .video {
+            if let custom = settings.customBackgroundURL {
+                selectCustomBackground(url: custom)
+            } else if let firstVid = settings.recentBackgroundURLs.first(where: { BackgroundMediaController.isVideoURL($0) }) {
+                selectCustomBackground(url: firstVid)
+            }
+        }
+
+        if profile.lutEnabled, let hint = profile.lutFilenameHint,
+           let match = settings.recentLUTURLs.first(where: { $0.lastPathComponent == hint }) {
+            selectLUT(url: match)
+        } else {
+            settings.lutEnabled = profile.lutEnabled
+        }
+
+        syncEdgeLightOverlay()
+        reconfigureCaptureInput()
+    }
+
+    @MainActor
     public func selectCamera(uniqueID: String) {
         guard settings.selectedCameraUniqueID != uniqueID else { return }
         settings.selectedCameraUniqueID = uniqueID
+        depthAnalyzer.invalidateSceneCache()
         reconfigureCaptureInput()
     }
 
     @MainActor
     public func applyResolutionChange() {
+        let dims = resolvePipelineDimensions(for: settings.threadSafeSnapshot())
+        bgMedia.setTargetDecodeDimensions(width: dims.width, height: dims.height)
         reconfigureCaptureInput()
     }
 
@@ -180,6 +247,10 @@ public final class StudioPipeline: NSObject, ObservableObject, @unchecked Sendab
     public func selectCustomBackground(url: URL) {
         settings.customBackgroundURL = url
         settings.addRecentURL(url)
+        let dims = resolvePipelineDimensions(for: settings.threadSafeSnapshot())
+        bgMedia.setTargetDecodeDimensions(width: dims.width, height: dims.height)
+        depthAnalyzer.invalidateSceneCache()
+
         let isVid = BackgroundMediaController.isVideoURL(url)
         settings.backgroundMode = isVid ? .video : .image
         bgMedia.loadMedia(from: url) { [weak self] ok, summary in
@@ -224,6 +295,8 @@ public final class StudioPipeline: NSObject, ObservableObject, @unchecked Sendab
             virtualCamStatus = ok ? "Live → \(msg)" : msg
             if !ok {
                 settings.virtualCamEnabled = false
+            } else if settings.resolution == .autoClient {
+                reconfigureCaptureInput()
             }
         } else {
             sinkBridge.stop()
@@ -241,8 +314,6 @@ public final class StudioPipeline: NSObject, ObservableObject, @unchecked Sendab
         )
     }
 
-    /// Starts hardware capture, Media Engine decode, ANE segmentation, and Metal ONLY when >= 1 output is active.
-    /// Drops to 0.0% CPU / 0.0% GPU when all consumers close.
     @MainActor
     public func updatePowerState() {
         let shouldRun = isPopoverVisible || isCleanWindowVisible || settings.virtualCamEnabled || isRecording
@@ -259,14 +330,17 @@ public final class StudioPipeline: NSObject, ObservableObject, @unchecked Sendab
     @MainActor
     private func startPipeline() {
         isPipelineRunning = true
+        let snap = settings.threadSafeSnapshot()
+        let dims = resolvePipelineDimensions(for: snap)
+        bgMedia.setTargetDecodeDimensions(width: dims.width, height: dims.height)
         bgMedia.setPlaybackActive(settings.backgroundMode == .video)
         syncEdgeLightOverlay()
 
         let camID = settings.selectedCameraUniqueID
-        let res = settings.resolution
+        let wantSensorHeadroom = settings.autoFramingEnabled
         captureQueue.async { [weak self] in
             guard let self = self else { return }
-            self.configureSessionLocked(cameraID: camID, resolution: res)
+            self.configureSessionLocked(cameraID: camID, targetDims: dims, allowSensorHeadroom: wantSensorHeadroom)
             if !self.captureSession.isRunning {
                 self.captureSession.startRunning()
             }
@@ -294,17 +368,22 @@ public final class StudioPipeline: NSObject, ObservableObject, @unchecked Sendab
     }
 
     @MainActor
-    private func reconfigureCaptureInput() {
+    public func reconfigureCaptureInput() {
         guard isPipelineRunning else { return }
         let camID = settings.selectedCameraUniqueID
-        let res = settings.resolution
+        let dims = resolvePipelineDimensions(for: settings.threadSafeSnapshot())
+        bgMedia.setTargetDecodeDimensions(width: dims.width, height: dims.height)
+        let wantSensorHeadroom = settings.autoFramingEnabled
         captureQueue.async { [weak self] in
-            self?.configureSessionLocked(cameraID: camID, resolution: res)
+            self?.configureSessionLocked(cameraID: camID, targetDims: dims, allowSensorHeadroom: wantSensorHeadroom)
         }
     }
 
-    private func configureSessionLocked(cameraID: String, resolution: CaptureResolutionPreset) {
-        if activeDeviceInput?.device.uniqueID == cameraID && configuredPresetResolution == resolution && !captureSession.inputs.isEmpty {
+    private func configureSessionLocked(cameraID: String, targetDims: (width: Int, height: Int), allowSensorHeadroom: Bool) {
+        if activeDeviceInput?.device.uniqueID == cameraID
+            && configuredDimensions == targetDims
+            && configuredSensorHeadroom == allowSensorHeadroom
+            && !captureSession.inputs.isEmpty {
             return
         }
 
@@ -326,7 +405,6 @@ public final class StudioPipeline: NSObject, ObservableObject, @unchecked Sendab
         }
 
         if captureSession.outputs.isEmpty {
-            // Request hardware-native biplanar NV12 ('420v') for zero conversion from Facecam 4K / FaceTime HD
             videoDataOutput.videoSettings = [
                 kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
                 kCVPixelBufferMetalCompatibilityKey as String: true
@@ -338,19 +416,18 @@ public final class StudioPipeline: NSObject, ObservableObject, @unchecked Sendab
             }
         }
 
-        // Pick best matching native format (preferring '420v' at requested 3840x2160 or 1920x1080 @ 30-60fps)
-        selectBestDeviceFormat(device: device, targetWidth: Int32(resolution.width), targetHeight: Int32(resolution.height))
-        configuredPresetResolution = resolution
+        // Stick directly to the downstream client's requested resolution (e.g. 1920x1080 for Teams/Meet)
+        // unless Lossless Auto-Framing is explicitly toggled ON (where 4K sensor headroom keeps digital pan/zoom lossless!).
+        let sensorCapW = Int32(allowSensorHeadroom ? max(targetDims.width, 3840) : targetDims.width)
+        let sensorCapH = Int32(allowSensorHeadroom ? max(targetDims.height, 2160) : targetDims.height)
+        selectBestDeviceFormat(device: device, targetWidth: sensorCapW, targetHeight: sensorCapH)
+
+        configuredDimensions = targetDims
+        configuredSensorHeadroom = allowSensorHeadroom
         compositor.resetTemporalHistory()
     }
 
     private func selectBestDeviceFormat(device: AVCaptureDevice, targetWidth: Int32, targetHeight: Int32) {
-        // Universal camera format scorer across built-in MacBook FaceTime HD (1080p/720p + square Center Stage),
-        // Continuity Camera (iPhone), Apple Studio Display, external 4K/1080p/720p UVC webcams, and HDMI capture cards:
-        // 1. Exclude portrait/square sensor crops when landscape formats exist.
-        // 2. Prefer >= 24 fps real-time video modes over low-fps 5MP/12MP still-photo modes.
-        // 3. Cap at requested resolution (4K or 1080p), falling back gracefully to camera's max native resolution
-        //    (e.g. 1920x1080 on MacBook FaceTime HD Camera while still compositing 4K backgrounds!).
         let allVideoFormats = device.formats.filter { fmt in
             CMFormatDescriptionGetMediaType(fmt.formatDescription) == kCMMediaType_Video
         }
@@ -371,7 +448,6 @@ public final class StudioPipeline: NSObject, ObservableObject, @unchecked Sendab
         let sorted = pool.sorted { a, b in
             let da = CMVideoFormatDescriptionGetDimensions(a.formatDescription)
             let db = CMVideoFormatDescriptionGetDimensions(b.formatDescription)
-            // Prefer 16:9-like widescreen aspect over 4:3 when resolution tier is comparable
             let aspectA = abs((Double(da.width) / Double(max(1, da.height))) - (16.0 / 9.0)) < 0.12
             let aspectB = abs((Double(db.width) / Double(max(1, db.height))) - (16.0 / 9.0)) < 0.12
             if da.width != db.width { return da.width > db.width }
@@ -388,8 +464,6 @@ public final class StudioPipeline: NSObject, ObservableObject, @unchecked Sendab
         do {
             try device.lockForConfiguration()
             device.activeFormat = best
-            // Safely pick a valid AVFrameRateRange and use its exact CMTime bounds when discrete
-            // (prevents NSInvalidArgumentException on built-in MacBook FaceTime HD / appleh13camerad!)
             if let range30 = best.videoSupportedFrameRateRanges.first(where: { $0.minFrameRate <= 30.01 && $0.maxFrameRate >= 29.97 }) {
                 if abs(range30.maxFrameRate - range30.minFrameRate) < 0.1 {
                     device.activeVideoMinFrameDuration = range30.minFrameDuration
@@ -410,6 +484,8 @@ public final class StudioPipeline: NSObject, ObservableObject, @unchecked Sendab
 
     @MainActor
     private func restoreCustomBackgroundIfNeeded() {
+        let dims = resolvePipelineDimensions(for: settings.threadSafeSnapshot())
+        bgMedia.setTargetDecodeDimensions(width: dims.width, height: dims.height)
         if let url = settings.customBackgroundURL, FileManager.default.fileExists(atPath: url.path) {
             bgMedia.loadMedia(from: url) { [weak self] ok, summary in
                 Task { @MainActor in
@@ -425,15 +501,11 @@ public final class StudioPipeline: NSObject, ObservableObject, @unchecked Sendab
         }
     }
 
-    // MARK: - 4K HEVC Hardware Recording
+    // MARK: - Hardware HEVC Recording
 
     @MainActor
     public func toggleRecording() {
-        if isRecording {
-            stopRecording()
-        } else {
-            startRecording()
-        }
+        if isRecording { stopRecording() } else { startRecording() }
     }
 
     @MainActor
@@ -443,8 +515,9 @@ public final class StudioPipeline: NSObject, ObservableObject, @unchecked Sendab
         let stamp = ISO8601DateFormatter().string(from: Date()).replacingOccurrences(of: ":", with: "-")
         let outURL = outDir.appendingPathComponent("StudioCam_\(stamp).mov")
 
-        let w = settings.resolution.width
-        let h = settings.resolution.height
+        let dims = resolvePipelineDimensions(for: settings.threadSafeSnapshot())
+        let w = dims.width
+        let h = dims.height
         guard let writer = try? AVAssetWriter(outputURL: outURL, fileType: .mov) else { return }
 
         let videoSettings: [String: Any] = [
@@ -452,7 +525,7 @@ public final class StudioPipeline: NSObject, ObservableObject, @unchecked Sendab
             AVVideoWidthKey: w,
             AVVideoHeightKey: h,
             AVVideoCompressionPropertiesKey: [
-                AVVideoAverageBitRateKey: w >= 3840 ? 28_000_000 : 10_000_000
+                AVVideoAverageBitRateKey: w >= 3840 ? 28_000_000 : 12_000_000
             ]
         ]
         let input = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
@@ -514,66 +587,93 @@ extension StudioPipeline: AVCaptureVideoDataOutputSampleBufferDelegate {
     ) {
         guard let camPB = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         let snap = settings.threadSafeSnapshot()
+        let outDims = resolvePipelineDimensions(for: snap)
         frameIndex &+= 1
 
-        // 1. Run ANE Person Segmentation (plus low-rate 5 Hz Face / Hand tracking only when those features are active)
+        // 1. ANE Person Segmentation + Face Tracking (for Studio Light, Skin Polish, and Auto-Framing)
         let needsSegmentation = (snap.backgroundMode != .none) || snap.portraitEnabled || snap.studioLightEnabled || snap.edgeLightEnabled
-        if needsSegmentation {
+        let needsFace = snap.studioLightEnabled || snap.autoFramingEnabled || snap.skinPolishStrength > 0.01
+        let visionPB = compositor.makeVisionInputBuffer(from: camPB)
+
+        if needsSegmentation || needsFace {
             let desiredQuality: VNGeneratePersonSegmentationRequest.QualityLevel =
                 (snap.segmentationQuality == .accurateMax) ? .accurate : .balanced
             if segRequest.qualityLevel != desiredQuality {
                 segRequest.qualityLevel = desiredQuality
             }
 
-            var requests: [VNRequest] = [segRequest]
-            if snap.studioLightEnabled && (frameIndex % 6 == 0) {
-                requests.append(faceRequest)
-            }
-            if snap.reactionsGestureEnabled && (frameIndex % 10 == 0) {
-                requests.append(handRequest)
+            var requests: [VNRequest] = []
+            if needsSegmentation { requests.append(segRequest) }
+            if needsFace && (frameIndex % 5 == 0) { requests.append(faceRequest) }
+            if snap.reactionsGestureEnabled && (frameIndex % 10 == 0) { requests.append(handRequest) }
+
+            if !requests.isEmpty {
+                let t0 = CACurrentMediaTime()
+                try? visionSequenceHandler.perform(requests, on: visionPB, orientation: .up)
+                let aneMs = (CACurrentMediaTime() - t0) * 1000.0
+                if needsSegmentation {
+                    smoothedANEMs = (smoothedANEMs == 0) ? aneMs : (smoothedANEMs * 0.88 + aneMs * 0.12)
+                }
             }
 
-            let t0 = CACurrentMediaTime()
-            let visionPB = compositor.makeVisionInputBuffer(from: camPB)
-            try? visionSequenceHandler.perform(requests, on: visionPB, orientation: .up)
-            let aneMs = (CACurrentMediaTime() - t0) * 1000.0
-            smoothedANEMs = (smoothedANEMs == 0) ? aneMs : (smoothedANEMs * 0.88 + aneMs * 0.12)
-
-            if let maskObs = segRequest.results?.first {
+            if needsSegmentation, let maskObs = segRequest.results?.first {
                 cachedMaskBuffer = maskObs.pixelBuffer
             }
-            if snap.studioLightEnabled, let face = faceRequest.results?.first {
+            if needsFace, let face = faceRequest.results?.first {
                 let b = face.boundingBox
-                // Vision normalized origin is bottom-left; convert to top-left UV
                 let cx = Float(b.midX)
                 let cy = Float(1.0 - b.midY)
-                let rx = Float(max(0.12, b.width * 0.85))
-                let ry = Float(max(0.18, b.height * 1.15))
-                trackedFaceRect = trackedFaceRect * 0.70 + SIMD4<Float>(cx, cy, rx, ry) * 0.30
+                let rx = Float(max(0.11, b.width * 0.85))
+                let ry = Float(max(0.16, b.height * 1.15))
+                trackedFaceRect = trackedFaceRect * 0.72 + SIMD4<Float>(cx, cy, rx, ry) * 0.28
             }
             if snap.reactionsGestureEnabled {
                 evaluateHandReactionGesture()
             }
         }
 
-        // 2. Pull latest Media Engine 4K video background frame (or static GPU texture)
-        let (bgVideoPB, bgStaticTex) = bgMedia.currentBackgroundFrame()
+        // 2. Dead-Zone Tripod Damper for Lossless Cinema Auto-Framing
+        let camCropRect = computeAutoFramingCropRect(snap: snap)
 
-        // 3. Single-pass Metal Guided Filter + 4K Studio Composite
+        // 3. Pull Virtual Background Frame & Update Lazy On-Chip ANE 3D Scene-Depth Map
+        let (bgVideoPB, bgStaticTex) = bgMedia.currentBackgroundFrame()
+        if snap.portraitEnabled && snap.depthBokehEnabled {
+            if snap.backgroundMode == .none {
+                // Analyze real physical room & angled hallway (excluding foreground person mask!)
+                depthAnalyzer.maybeAnalyzeFrame(
+                    pixelBuffer: visionPB,
+                    foregroundMaskToExclude: cachedMaskBuffer,
+                    sourceToken: "liveCam:\(CVPixelBufferGetWidth(camPB))x\(CVPixelBufferGetHeight(camPB))",
+                    refreshIntervalSeconds: 4.5
+                )
+            } else if snap.backgroundMode == .video, let vPB = bgVideoPB {
+                // Analyze virtual background video of a real room!
+                depthAnalyzer.maybeAnalyzeFrame(
+                    pixelBuffer: vPB,
+                    foregroundMaskToExclude: nil,
+                    sourceToken: "vid:\(bgMedia.currentSourceToken)",
+                    refreshIntervalSeconds: 4.0
+                )
+            }
+        }
+
+        // 4. Single-pass Metal Composite at exact client-requested resolution
         let sinkActive = snap.virtualCamEnabled
-        let sinkDims = sinkActive ? sinkBridge.activeDimensions : (1920, 1080)
+        let sinkDims = sinkActive ? sinkBridge.activeDimensions : outDims
         guard let rendered = compositor.renderFrame(
+            outputDimensions: outDims,
             cameraPixelBuffer: camPB,
             segmentationMaskBuffer: cachedMaskBuffer,
             backgroundVideoBuffer: bgVideoPB,
             backgroundStaticTexture: bgStaticTex,
+            sceneDepthTexture: depthAnalyzer.depthTexture,
             faceRect: trackedFaceRect,
+            cameraCropRect: camCropRect,
             settings: snap,
             produceSink: sinkActive,
             sinkDimensions: sinkDims
         ) else { return }
 
-        // 4. Deliver to active outputs (Preview / Clean Window, Virtual Cam Sink, Recorder)
         onFrameRendered?(rendered.mainTexture)
 
         if sinkActive, let sinkPB = rendered.sinkPixelBuffer {
@@ -593,7 +693,7 @@ extension StudioPipeline: AVCaptureVideoDataOutputSampleBufferDelegate {
         }
         recorderLock.unlock()
 
-        // 5. Throttled 2 Hz Telemetry Update to MainActor UI (zero main-thread spam)
+        // 5. Throttled 2 Hz Telemetry Update
         let now = CACurrentMediaTime()
         if lastFrameTimestamp > 0 {
             let dt = now - lastFrameTimestamp
@@ -611,16 +711,44 @@ extension StudioPipeline: AVCaptureVideoDataOutputSampleBufferDelegate {
             let aneVal = smoothedANEMs
             let camW = CVPixelBufferGetWidth(camPB)
             let camH = CVPixelBufferGetHeight(camPB)
-            let outW = snap.resolution.width
-            let outH = snap.resolution.height
             Task { @MainActor [weak self] in
                 guard let self = self, self.isPipelineRunning else { return }
                 self.fpsTelemetry = fpsVal
                 self.gpuMsTelemetry = gpuVal
-                self.aneMsTelemetry = aneVal
-                self.resolutionTelemetry = "In \(camW)×\(camH) → Out \(outW)×\(outH)"
+                self.aneValAssign(aneVal)
+                self.resolutionTelemetry = "\(camW)×\(camH) → \(outDims.width)×\(outDims.height)"
             }
         }
+    }
+
+    @MainActor private func aneValAssign(_ v: Double) {
+        self.aneMsTelemetry = v
+    }
+
+    nonisolated private func computeAutoFramingCropRect(snap: RenderSettingsSnapshot) -> SIMD4<Float> {
+        guard snap.autoFramingEnabled else {
+            smoothedCropCenter = SIMD2<Float>(0.5, 0.5)
+            smoothedCropScale = 1.0
+            return SIMD4<Float>(0.0, 0.0, 1.0, 1.0)
+        }
+
+        let targetScale = 1.0 / max(1.05, min(1.85, snap.autoFramingZoom))
+        // Desired framing places eyes/face comfortably in upper-middle third (y ~ 0.40)
+        let desiredCenter = SIMD2<Float>(trackedFaceRect.x, trackedFaceRect.y + 0.05)
+
+        // Tripod dead-zone (±4.5%): ignore small head nods; smoothly glide when user shifts position
+        let delta = desiredCenter - tripodAnchorCenter
+        if hypot(delta.x, delta.y) > 0.045 {
+            tripodAnchorCenter = simd_mix(tripodAnchorCenter, desiredCenter, SIMD2<Float>(repeating: 0.08))
+        }
+
+        smoothedCropCenter = simd_mix(smoothedCropCenter, tripodAnchorCenter, SIMD2<Float>(repeating: 0.07))
+        smoothedCropScale = smoothedCropScale * 0.92 + targetScale * 0.08
+
+        let halfSpan = smoothedCropScale * 0.5
+        let clampedCX = max(halfSpan, min(1.0 - halfSpan, smoothedCropCenter.x))
+        let clampedCY = max(halfSpan, min(1.0 - halfSpan, smoothedCropCenter.y))
+        return SIMD4<Float>(clampedCX - halfSpan, clampedCY - halfSpan, smoothedCropScale, smoothedCropScale)
     }
 
     nonisolated private func evaluateHandReactionGesture() {
@@ -635,12 +763,10 @@ extension StudioPipeline: AVCaptureVideoDataOutputSampleBufferDelegate {
               let middleMCP = try? hand.recognizedPoint(.middleMCP),
               thumbTip.confidence > 0.6, indexTip.confidence > 0.6 else { return }
 
-        // Victory / Peace sign -> Confetti
         if indexTip.location.y > indexMCP.location.y + 0.08 && middleTip.location.y > middleMCP.location.y + 0.08 {
             lastReactionCooldownTime = now
             Task { @MainActor [weak self] in self?.settings.triggerReaction(3) }
         } else if thumbTip.location.y > thumbIP.location.y + 0.05 && indexTip.location.y < indexMCP.location.y + 0.02 {
-            // Thumbs up -> Ring burst
             lastReactionCooldownTime = now
             Task { @MainActor [weak self] in self?.settings.triggerReaction(1) }
         }

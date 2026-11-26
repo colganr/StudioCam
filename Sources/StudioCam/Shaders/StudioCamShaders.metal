@@ -1,53 +1,58 @@
 #include <metal_stdlib>
 using namespace metal;
 
+// Exact 224-byte 16-byte-aligned layout shared between Metal and Swift (`CompositeUniformsGPU`)
 struct CompositeUniforms {
-    uint2 outputSize;
-    uint2 camSize;
-    uint2 bgSize;
+    uint2 outputSize;          // 0
+    uint2 camSize;             // 8
+    uint2 bgSize;              // 16
+    uint camIsYUV;             // 24
+    uint camFullRange;         // 28
 
-    uint camIsYUV;          // 1 = biplanar NV12 (420v/420f), 0 = BGRA/RGBA
-    uint camFullRange;      // 1 = 420f, 0 = 420v
-    uint bgMode;            // 0 = none (original cam), 1 = gradient, 2 = static image (BGRA), 3 = video (NV12/BGRA)
-    uint bgIsYUV;           // 1 = biplanar NV12, 0 = BGRA/RGBA
+    uint bgMode;               // 32: 0=none, 1=gradient, 2=image, 3=video
+    uint bgIsYUV;              // 36
+    uint portraitEnabled;      // 40
+    float portraitStrength;    // 44
 
-    uint portraitEnabled;
-    float portraitStrength; // 0..1
+    uint depthBokehEnabled;    // 48: 1 = ANE 3D scene-depth graded optical bokeh
+    float focalPlaneOffset;    // 52: 0.0..0.6
+    uint studioLightEnabled;   // 56
+    float studioLightStrength; // 60
 
-    uint studioLightEnabled;
-    float studioLightStrength; // 0..1
+    uint edgeLightEnabled;     // 64
+    float edgeLightStrength;   // 68
+    float edgeLightWarmth;     // 72
+    float spillSuppression;    // 76
 
-    uint edgeLightEnabled;
-    float edgeLightStrength;   // 0..1
-    float edgeLightWarmth;     // 0 = cool daylight, 1 = warm tungsten
+    float edgeSoftness;        // 80
+    uint mirrorHorizontal;     // 84
+    float lightWrapStrength;   // 88: Optical Light Wrap (0..1)
+    float ambientMatchStrength;// 92: Live BG Ambient Color Match (0..1)
 
-    float spillSuppression;    // 0..1
-    float edgeSoftness;        // 0..1
-    uint mirrorHorizontal;     // 0 or 1
+    float skinPolishStrength;  // 96: UVC Forehead/Cheek De-Harshness (0..1)
+    float filmGrainStrength;   // 100: Unified 35mm Sensor Grain (0..1)
+    uint reactionType;         // 104
+    float reactionProgress;    // 108
 
-    float4 gradTopColor;
-    float4 gradBottomColor;
-    float4 faceRect;           // normalized [cx, cy, rx, ry] in UV space
+    float timeSeconds;         // 112
+    float lutStrength;         // 116
+    uint lutEnabled;           // 120
+    uint lutDimension;         // 124
 
-    uint reactionType;         // 0 = none, 1 = thumbsUp, 2 = heart, 3 = confetti, 4 = lasers
-    float reactionProgress;    // 0..1
-    float timeSeconds;
-    float lutStrength;         // 0..1
-
-    uint lutEnabled;           // 0 or 1
-    uint lutDimension;         // e.g. 33
-    uint _lutPad0;
-    uint _lutPad1;
-    float4 lutDomainMin;
-    float4 lutDomainMax;
+    float4 gradTopColor;       // 128
+    float4 gradBottomColor;    // 144
+    float4 faceRect;           // 160
+    float4 camCropRect;        // 176: [originX, originY, widthFrac, heightFrac] for lossless Auto-Framing
+    float4 lutDomainMin;       // 192
+    float4 lutDomainMax;       // 208
 };
 
 struct GuidedUniforms {
     uint2 gridSize;
     int radius;
     float eps;
-    float temporalBlend;       // e.g. 0.78
-    float colorSimSigma;       // e.g. 0.055
+    float temporalBlend;
+    float colorSimSigma;
     uint hasHistory;
     uint camIsYUV;
     uint camFullRange;
@@ -57,7 +62,6 @@ inline float3 yuvToRGB(float ySample, float2 cbcrSample, bool fullRange) {
     float y = fullRange ? ySample : ((ySample - (16.0f / 255.0f)) * (255.0f / 219.0f));
     float cb = cbcrSample.x - 0.5f;
     float cr = cbcrSample.y - 0.5f;
-    // Rec.709 conversion
     float r = y + 1.5748f * cr;
     float g = y - 0.1873f * cb - 0.4681f * cr;
     float b = y + 1.8556f * cb;
@@ -85,8 +89,7 @@ inline float2 aspectFillUV(float2 dstUV, uint2 srcSize, uint2 dstSize) {
     return clamp(uv, 0.0005f, 0.9995f);
 }
 
-// Pass 1: Sample camera guide + ANE segmentation mask, apply Portrait.framework-style
-// color-similarity-gated temporal EMA, and pack (I, p, I*I, I*p) for O(1) separable box filtering.
+// Pass 1: Guide prep + Portrait.framework-style color-similarity-gated temporal EMA
 kernel void guidedPrepAndTemporalEMA(
     texture2d<float, access::sample> camPlane0 [[texture(0)]],
     texture2d<float, access::sample> camPlane1 [[texture(1)]],
@@ -114,10 +117,6 @@ kernel void guidedPrepAndTemporalEMA(
     float luma = rgbLuma(rgb);
     float p = saturate(rawMaskTex.sample(linSamp, uv).r);
 
-    // Color-similarity-gated temporal EMA (modeled on Portrait.framework's
-    // temporalFilterExponentialMovingAverageColorSimilarities):
-    // Steady color -> high temporal stability (zero edge shimmer);
-    // Sudden color change -> instant responsiveness (zero motion ghosting).
     if (u.hasHistory != 0) {
         float4 prev = prevGuideAndMask.read(gid);
         float3 prevRGB = prev.rgb;
@@ -134,7 +133,7 @@ kernel void guidedPrepAndTemporalEMA(
     statsOut.write(float4(luma, p, luma * luma, luma * p), gid);
 }
 
-// Pass 2a: Separable horizontal box filter on (I, p, I*I, I*p)
+// Pass 2a: Separable horizontal box filter
 kernel void boxFilterHorizontal(
     texture2d<float, access::read> src [[texture(0)]],
     texture2d<float, access::write> dst [[texture(1)]],
@@ -142,7 +141,6 @@ kernel void boxFilterHorizontal(
     uint2 gid [[thread_position_in_grid]]
 ) {
     if (gid.x >= u.gridSize.x || gid.y >= u.gridSize.y) return;
-
     int r = u.radius;
     int maxX = int(u.gridSize.x) - 1;
     float4 acc = float4(0.0f);
@@ -161,7 +159,6 @@ kernel void boxFilterVerticalAndCoeffs(
     uint2 gid [[thread_position_in_grid]]
 ) {
     if (gid.x >= u.gridSize.x || gid.y >= u.gridSize.y) return;
-
     int r = u.radius;
     int maxY = int(u.gridSize.y) - 1;
     float4 acc = float4(0.0f);
@@ -169,8 +166,7 @@ kernel void boxFilterVerticalAndCoeffs(
         int sy = clamp(int(gid.y) + dy, 0, maxY);
         acc += src.read(uint2(gid.x, sy));
     }
-    float4 mean = acc / float(2 * r + 1); // (meanI, meanP, meanII, meanIP)
-
+    float4 mean = acc / float(2 * r + 1);
     float varI = max(0.0f, mean.z - mean.x * mean.x);
     float covIP = mean.w - mean.x * mean.y;
     float a = covIP / (varI + u.eps);
@@ -178,7 +174,7 @@ kernel void boxFilterVerticalAndCoeffs(
     abOut.write(float4(a, b, 0.0f, 0.0f), gid);
 }
 
-// Pass 2c: Lightweight 3x3 mean of (a, b) for smooth hair-edge upsampling
+// Pass 2c: 3x3 smoothing of (a, b)
 kernel void smoothGuidedCoeffs(
     texture2d<float, access::read> abIn [[texture(0)]],
     texture2d<float, access::write> abSmoothOut [[texture(1)]],
@@ -199,12 +195,12 @@ kernel void smoothGuidedCoeffs(
     abSmoothOut.write(float4(acc * (1.0f / 9.0f), 0.0f, 0.0f), gid);
 }
 
-// Optional downsample pass for fast MPSImageGaussianBlur when Portrait bokeh is active
+// Fast downsample pass for ANE Vision input & multi-stop optical bokeh pyramid
 kernel void downsampleHalfBGRA(
     texture2d<float, access::sample> plane0 [[texture(0)]],
     texture2d<float, access::sample> plane1 [[texture(1)]],
     texture2d<float, access::write> halfOut [[texture(2)]],
-    constant uint3& params [[buffer(0)]], // x=isYUV, y=fullRange, z=unused
+    constant uint3& params [[buffer(0)]],
     uint2 gid [[thread_position_in_grid]]
 ) {
     uint2 sz = uint2(halfOut.get_width(), halfOut.get_height());
@@ -222,17 +218,55 @@ kernel void downsampleHalfBGRA(
     halfOut.write(float4(rgb, 1.0f), gid);
 }
 
-// Procedural subtle Reaction overlay (zero external texture overhead)
+// 16-Tap Golden-Angle Vogel Spiral Optical Lens Disc Bokeh + Specular Highlight Bloom (480x270 -> < 0.11 ms GPU!)
+// Makes distant hallway lamps, windows, and highlights bloom into real circular f/1.4 optical bokeh discs!
+kernel void opticalBokehDiscPass(
+    texture2d<float, access::sample> srcNearBlur [[texture(0)]],
+    texture2d<float, access::write>  dstFarBokeh [[texture(1)]],
+    constant float& radiusScale [[buffer(0)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint2 sz = uint2(dstFarBokeh.get_width(), dstFarBokeh.get_height());
+    if (gid.x >= sz.x || gid.y >= sz.y) return;
+
+    constexpr sampler linSamp(coord::normalized, address::clamp_to_edge, filter::linear);
+    float2 uv = (float2(gid) + 0.5f) / float2(sz);
+    float2 aspectRadius = float2(1.0f / 1.7777f, 1.0f) * (0.012f + 0.026f * saturate(radiusScale));
+
+    float3 weightedSum = float3(0.0f);
+    float weightTotal = 0.0f;
+
+    // Center tap + 16 Golden-Angle Vogel disc taps
+    float3 centerC = srcNearBlur.sample(linSamp, uv).rgb;
+    float centerL = rgbLuma(centerC);
+    float centerW = 1.0f + 4.5f * pow(max(0.0f, centerL - 0.62f), 2.0f);
+    weightedSum += centerC * centerW;
+    weightTotal += centerW;
+
+    const float goldenAngle = 2.39996323f;
+    for (int i = 1; i <= 16; ++i) {
+        float r = sqrt(float(i) / 16.5f);
+        float theta = float(i) * goldenAngle;
+        float2 offset = float2(cos(theta), sin(theta)) * r * aspectRadius;
+        float3 c = srcNearBlur.sample(linSamp, uv + offset).rgb;
+        float l = rgbLuma(c);
+        // Optical highlight bloom weight so bright lights form crisp bokeh circles
+        float w = 1.0f + 5.5f * pow(max(0.0f, l - 0.60f), 2.0f);
+        weightedSum += c * w;
+        weightTotal += w;
+    }
+
+    dstFarBokeh.write(float4(saturate(weightedSum / max(1e-4f, weightTotal)), 1.0f), gid);
+}
+
 inline float3 applyReactionOverlay(float3 color, float2 uv, uint reactionType, float progress, float t) {
     if (reactionType == 0 || progress <= 0.0f || progress >= 1.0f) return color;
     float fade = sin(progress * 3.14159265f);
     if (reactionType == 4) {
-        // Lasers sweep
         float beam1 = exp(-120.0f * fabs(uv.y - (0.85f - 0.65f * progress) - 0.18f * (uv.x - 0.5f)));
         float beam2 = exp(-120.0f * fabs(uv.y - (0.80f - 0.70f * progress) + 0.22f * (uv.x - 0.5f)));
         color += fade * (beam1 * float3(1.0f, 0.15f, 0.55f) + beam2 * float3(0.15f, 0.85f, 1.0f));
     } else if (reactionType == 3) {
-        // Confetti sparkles
         float2 cell = floor(uv * float2(28.0f, 16.0f) + float2(0.0f, -progress * 10.0f));
         float h = fract(sin(dot(cell, float2(12.9898f, 78.233f))) * 43758.5453f);
         if (h > 0.90f) {
@@ -240,14 +274,12 @@ inline float3 applyReactionOverlay(float3 color, float2 uv, uint reactionType, f
             color = mix(color, c, fade * 0.85f);
         }
     } else if (reactionType == 2) {
-        // Floating warm heart glow
         float2 p = (uv - float2(0.78f, 0.72f - 0.38f * progress)) * float2(16.0f, -9.0f);
         p.y -= sqrt(max(0.0f, fabs(p.x))) * 0.65f;
         float d = length(p) - 0.85f;
         float mask = 1.0f - smoothstep(-0.08f, 0.08f, d);
         color = mix(color, float3(1.0f, 0.20f, 0.36f), mask * fade * 0.92f);
     } else if (reactionType == 1) {
-        // Crisp glowing ring-burst badge
         float2 p = (uv - float2(0.22f, 0.68f - 0.30f * progress)) * float2(1.777f, 1.0f);
         float r = length(p);
         float ring = exp(-90.0f * fabs(r - (0.04f + 0.08f * progress)));
@@ -256,18 +288,18 @@ inline float3 applyReactionOverlay(float3 color, float2 uv, uint reactionType, f
     return saturate(color);
 }
 
-// Pass 3: Single Fused 4K Studio Compositor
-// Evaluates guided 4K hair matte, color-spill suppression, 4K video/image/gradient background,
-// Portrait depth bokeh, SRLv2-style Studio Light, and Edge Light in one pass.
+// Pass 3: Single Fused Studio Compositor
 kernel void compositeStudioFrame(
-    texture2d<float, access::sample> camPlane0   [[texture(0)]],
-    texture2d<float, access::sample> camPlane1   [[texture(1)]],
-    texture2d<float, access::sample> abTex       [[texture(2)]],
-    texture2d<float, access::sample> bgPlane0    [[texture(3)]],
-    texture2d<float, access::sample> bgPlane1    [[texture(4)]],
-    texture2d<float, access::sample> blurredTex  [[texture(5)]],
-    texture2d<float, access::write>  outBGRA     [[texture(6)]],
-    texture3d<float, access::sample> lutTex3D    [[texture(7)]],
+    texture2d<float, access::sample> camPlane0      [[texture(0)]],
+    texture2d<float, access::sample> camPlane1      [[texture(1)]],
+    texture2d<float, access::sample> abTex          [[texture(2)]],
+    texture2d<float, access::sample> bgPlane0       [[texture(3)]],
+    texture2d<float, access::sample> bgPlane1       [[texture(4)]],
+    texture2d<float, access::sample> nearBlurTex    [[texture(5)]],
+    texture2d<float, access::write>  outBGRA        [[texture(6)]],
+    texture3d<float, access::sample> lutTex3D       [[texture(7)]],
+    texture2d<float, access::sample> farBokehTex    [[texture(8)]],
+    texture2d<float, access::sample> sceneDepthTex  [[texture(9)]],
     constant CompositeUniforms& u [[buffer(0)]],
     uint2 gid [[thread_position_in_grid]]
 ) {
@@ -281,8 +313,10 @@ kernel void compositeStudioFrame(
         sampleUV.x = 1.0f - sampleUV.x;
     }
 
-    // 1. Aspect-fill camera UV + full-4K foreground RGB & Luma
-    float2 camUV = aspectFillUV(sampleUV, u.camSize, u.outputSize);
+    // 1. Lossless Auto-Framing Crop + Aspect-Fill Camera UV
+    float2 croppedUV = clamp(u.camCropRect.xy + sampleUV * u.camCropRect.zw, 0.0005f, 0.9995f);
+    float2 camUV = aspectFillUV(croppedUV, u.camSize, u.outputSize);
+
     float3 fgRGB;
     if (u.camIsYUV != 0) {
         float y = camPlane0.sample(linSamp, camUV).r;
@@ -293,120 +327,176 @@ kernel void compositeStudioFrame(
     }
     float fgLuma = rgbLuma(fgRGB);
 
-    // 2. Evaluate 4K Guided Hair Matte: alpha = a * I_4K + b
+    // 2. Guided Hair Matte: alpha = a * I + b
     float2 ab = abTex.sample(linSamp, camUV).rg;
     float rawAlpha = saturate(ab.x * fgLuma + ab.y);
     float lowEdge = mix(0.02f, 0.14f, 1.0f - u.edgeSoftness);
     float highEdge = mix(0.98f, 0.86f, 1.0f - u.edgeSoftness);
     float alpha = smoothstep(lowEdge, highEdge, rawAlpha);
 
-    // 3. Evaluate Background Layer (Original / Gradient / 4K Static Image / 4K Video + Portrait Bokeh)
+    // 2b. Subtle Face UVC De-Harshness (softens digital webcam forehead/under-eye oversharpening, keeps eyes/glasses sharp)
+    if (u.skinPolishStrength > 0.01f && alpha > 0.65f) {
+        float2 faceCenter = u.faceRect.xy;
+        if (u.mirrorHorizontal != 0) faceCenter.x = 1.0f - faceCenter.x;
+        float2 fd = (dstUV - faceCenter) / max(u.faceRect.zw * 1.15f, float2(0.10f, 0.14f));
+        float inFace = 1.0f - smoothstep(0.65f, 1.25f, length(fd));
+        bool warmSkin = (fgRGB.r > fgRGB.g * 0.95f) && (fgRGB.g > fgRGB.b * 0.82f);
+        if (inFace > 0.01f && warmSkin) {
+            // 4-tap local micro-neighbor smooth that preserves high-contrast features (eyes/glasses/stubble)
+            float2 stepUV = 1.35f / float2(u.outputSize);
+            float3 n1 = u.camIsYUV != 0
+                ? yuvToRGB(camPlane0.sample(linSamp, camUV + float2(stepUV.x, 0)).r, camPlane1.sample(linSamp, camUV + float2(stepUV.x, 0)).rg, u.camFullRange != 0)
+                : camPlane0.sample(linSamp, camUV + float2(stepUV.x, 0)).rgb;
+            float3 n2 = u.camIsYUV != 0
+                ? yuvToRGB(camPlane0.sample(linSamp, camUV - float2(stepUV.x, 0)).r, camPlane1.sample(linSamp, camUV - float2(stepUV.x, 0)).rg, u.camFullRange != 0)
+                : camPlane0.sample(linSamp, camUV - float2(stepUV.x, 0)).rgb;
+            float3 localAvg = 0.5f * (n1 + n2);
+            float detailDiff = length(fgRGB - localAvg);
+            float edgeKeep = 1.0f - smoothstep(0.025f, 0.095f, detailDiff);
+            fgRGB = mix(fgRGB, localAvg, inFace * edgeKeep * saturate(u.skinPolishStrength) * 0.55f);
+            fgLuma = rgbLuma(fgRGB);
+        }
+    }
+
+    // 3. Evaluate Background Layer + True 3D Scene-Depth Graded Optical Bokeh (works on Real Room AND Virtual Rooms!)
     float3 bgRGB = fgRGB;
+    float2 activeSceneUV = camUV;
     if (u.bgMode == 0) {
-        // Real room background (with Portrait blur when enabled)
-        if (u.portraitEnabled != 0) {
-            float3 blurredCam = blurredTex.sample(linSamp, camUV).rgb;
-            bgRGB = mix(fgRGB, blurredCam, saturate(u.portraitStrength));
+        activeSceneUV = camUV;
+        if (u.portraitEnabled != 0 && u.portraitStrength > 0.01f) {
+            float3 nearSoft = nearBlurTex.sample(linSamp, camUV).rgb;
+            if (u.depthBokehEnabled != 0) {
+                float dist = saturate(sceneDepthTex.sample(linSamp, camUV).r);
+                float coc = saturate((dist - u.focalPlaneOffset) / max(0.12f, 1.0f - u.focalPlaneOffset)) * saturate(u.portraitStrength);
+                float3 farBokeh = farBokehTex.sample(linSamp, camUV).rgb;
+                // Progressive 3-stop optical lens curve: Sharp -> Gentle Near Blur -> Deep Golden-Angle Hallway Bokeh
+                float3 stage1 = mix(fgRGB, nearSoft, smoothstep(0.0f, 0.42f, coc));
+                bgRGB = mix(stage1, farBokeh, smoothstep(0.32f, 0.95f, coc));
+            } else {
+                bgRGB = mix(fgRGB, nearSoft, saturate(u.portraitStrength));
+            }
         }
     } else if (u.bgMode == 1) {
-        // Studio vertical/diagonal gradient (matching Portrait.framework gradient style)
         float t = saturate(dstUV.y * 0.85f + dstUV.x * 0.15f);
         bgRGB = mix(u.gradTopColor.rgb, u.gradBottomColor.rgb, smoothstep(0.0f, 1.0f, t));
     } else {
-        // Static Image (bgMode == 2) or 4K Looping Video (bgMode == 3)
         float2 bgUV = aspectFillUV(dstUV, u.bgSize, u.outputSize);
-        if (u.portraitEnabled != 0 && u.portraitStrength > 0.01f) {
-            float3 sharpBG;
-            if (u.bgIsYUV != 0) {
-                float by = bgPlane0.sample(linSamp, bgUV).r;
-                float2 bcbcr = bgPlane1.sample(linSamp, bgUV).rg;
-                sharpBG = yuvToRGB(by, bcbcr, false);
-            } else {
-                sharpBG = bgPlane0.sample(linSamp, bgUV).rgb;
-            }
-            float3 softBG = blurredTex.sample(linSamp, bgUV).rgb;
-            bgRGB = mix(sharpBG, softBG, saturate(u.portraitStrength));
+        activeSceneUV = bgUV;
+        float3 sharpBG;
+        if (u.bgIsYUV != 0) {
+            float by = bgPlane0.sample(linSamp, bgUV).r;
+            float2 bcbcr = bgPlane1.sample(linSamp, bgUV).rg;
+            sharpBG = yuvToRGB(by, bcbcr, false);
         } else {
-            if (u.bgIsYUV != 0) {
-                float by = bgPlane0.sample(linSamp, bgUV).r;
-                float2 bcbcr = bgPlane1.sample(linSamp, bgUV).rg;
-                bgRGB = yuvToRGB(by, bcbcr, false);
+            sharpBG = bgPlane0.sample(linSamp, bgUV).rgb;
+        }
+
+        if (u.portraitEnabled != 0 && u.portraitStrength > 0.01f) {
+            float3 nearSoft = nearBlurTex.sample(linSamp, bgUV).rgb;
+            if (u.depthBokehEnabled != 0) {
+                // Depth map computed directly on the virtual room image/video!
+                float dist = saturate(sceneDepthTex.sample(linSamp, bgUV).r);
+                float coc = saturate((dist - u.focalPlaneOffset) / max(0.12f, 1.0f - u.focalPlaneOffset)) * saturate(u.portraitStrength);
+                float3 farBokeh = farBokehTex.sample(linSamp, bgUV).rgb;
+                float3 stage1 = mix(sharpBG, nearSoft, smoothstep(0.0f, 0.42f, coc));
+                bgRGB = mix(stage1, farBokeh, smoothstep(0.32f, 0.95f, coc));
             } else {
-                bgRGB = bgPlane0.sample(linSamp, bgUV).rgb;
+                bgRGB = mix(sharpBG, nearSoft, saturate(u.portraitStrength));
             }
+        } else {
+            bgRGB = sharpBG;
         }
     }
 
-    // 4. Hair / Semi-Transparent Edge Color-Spill Suppression (modeled on PTSpillCorrection)
-    // Neutralizes room wall/monitor tint bleeding through fine hair wisps and harmonizes with new BG.
-    if (u.bgMode != 0 && alpha > 0.03f && alpha < 0.94f && u.spillSuppression > 0.01f) {
-        float edgeBand = 4.0f * alpha * (1.0f - alpha); // peaks at alpha = 0.5
-        float3 neutralFG = float3(fgLuma);
-        float bgLuma = max(0.05f, rgbLuma(bgRGB));
-        float3 ambientTintedFG = neutralFG * mix(float3(1.0f), bgRGB / bgLuma, 0.25f);
-        fgRGB = mix(fgRGB, ambientTintedFG, edgeBand * u.spillSuppression * 0.65f);
+    // 4. Hair Color-Spill Suppression + Live Ambient Color Match + Optical Light Wrap
+    if (u.bgMode != 0) {
+        // 4a. Live Ambient Room Color Match (nudges subject tint to match virtual room lighting dynamically)
+        if (u.ambientMatchStrength > 0.01f && alpha > 0.05f) {
+            float3 roomAmb = 0.25f * (
+                farBokehTex.sample(linSamp, float2(0.25f, 0.35f)).rgb +
+                farBokehTex.sample(linSamp, float2(0.75f, 0.35f)).rgb +
+                farBokehTex.sample(linSamp, float2(0.25f, 0.65f)).rgb +
+                farBokehTex.sample(linSamp, float2(0.75f, 0.65f)).rgb
+            );
+            float ambLuma = max(0.08f, rgbLuma(roomAmb));
+            float3 ambTint = clamp(roomAmb / ambLuma, float3(0.78f), float3(1.26f));
+            fgRGB = saturate(fgRGB * mix(float3(1.0f), ambTint, saturate(u.ambientMatchStrength) * 0.28f));
+        }
+
+        // 4b. Semi-transparent hair spill suppression
+        if (alpha > 0.03f && alpha < 0.94f && u.spillSuppression > 0.01f) {
+            float edgeBand = 4.0f * alpha * (1.0f - alpha);
+            float3 neutralFG = float3(fgLuma);
+            float bgLuma = max(0.05f, rgbLuma(bgRGB));
+            float3 ambientTintedFG = neutralFG * mix(float3(1.0f), bgRGB / bgLuma, 0.28f);
+            fgRGB = mix(fgRGB, ambientTintedFG, edgeBand * u.spillSuppression * 0.65f);
+        }
+
+        // 4c. Optical Light Wrap (bleeds bright virtual background glow softly over subject rim!)
+        if (u.lightWrapStrength > 0.01f && alpha > 0.10f) {
+            float3 localBGGlow = nearBlurTex.sample(linSamp, activeSceneUV).rgb;
+            float glowEnergy = smoothstep(0.25f, 0.95f, rgbLuma(localBGGlow));
+            float rimWrap = (1.0f - smoothstep(0.30f, 0.98f, alpha)) * smoothstep(0.05f, 0.45f, alpha);
+            fgRGB = saturate(fgRGB + localBGGlow * (glowEnergy * rimWrap * saturate(u.lightWrapStrength) * 0.55f));
+        }
     }
 
-    // 5. Studio Light (modeled on Portrait.framework SRLv2: face/subject contour lift + BG dimming)
+    // 5. Studio Light (SRLv2 contour lift + background dimming)
     if (u.studioLightEnabled != 0 && u.studioLightStrength > 0.001f) {
         float s = saturate(u.studioLightStrength);
-        // Subtle studio background darkening (studiolightBackgroundDimming)
-        bgRGB *= mix(1.0f, 0.72f, s);
+        bgRGB *= mix(1.0f, 0.74f, s);
 
-        // Soft elliptical face/torso key light centered on tracked face
         float2 faceCenter = u.faceRect.xy;
-        if (u.mirrorHorizontal != 0) {
-            faceCenter.x = 1.0f - faceCenter.x;
-        }
+        if (u.mirrorHorizontal != 0) faceCenter.x = 1.0f - faceCenter.x;
         float2 radii = max(u.faceRect.zw, float2(0.18f, 0.28f));
         float2 d = (dstUV - faceCenter) / (radii * 1.65f);
         float keyFalloff = exp(-0.5f * dot(d, d));
-
-        // Lift midtones and shadows without clipping highlights (SRLv2 tone curve)
         float shadowLift = (1.0f - fgLuma) * fgLuma * 4.0f;
-        fgRGB += fgRGB * (0.30f * s * keyFalloff * (0.45f + 0.55f * shadowLift));
-        fgRGB = saturate(fgRGB);
+        fgRGB = saturate(fgRGB + fgRGB * (0.28f * s * keyFalloff * (0.45f + 0.55f * shadowLift)));
     }
 
-    // 6. Edge Light (rim & ring-light subject illumination)
+    // 6. Edge Light
     if (u.edgeLightEnabled != 0 && u.edgeLightStrength > 0.001f) {
         float e = saturate(u.edgeLightStrength);
-        float3 coolTint = float3(0.92f, 0.96f, 1.0f);
-        float3 warmTint = float3(1.0f, 0.88f, 0.74f);
-        float3 lightTint = mix(coolTint, warmTint, saturate(u.edgeLightWarmth));
-
-        // Rim glow along silhouette + soft fill from screen borders
+        float3 lightTint = mix(float3(0.92f, 0.96f, 1.0f), float3(1.0f, 0.88f, 0.74f), saturate(u.edgeLightWarmth));
         float rim = 4.0f * alpha * (1.0f - alpha);
         float borderProx = 1.0f - (4.0f * dstUV.x * (1.0f - dstUV.x)) * (4.0f * dstUV.y * (1.0f - dstUV.y));
         float fill = 0.14f * e + 0.22f * e * rim + 0.08f * e * borderProx;
         fgRGB = saturate(fgRGB + lightTint * fill * (1.0f - 0.55f * fgRGB));
     }
 
-    // 7. Final Alpha Composite (Premultiplied-free crisp guided blend)
+    // 7. Final Guided Alpha Composite
     bool needComposite = (u.bgMode != 0) || (u.portraitEnabled != 0) || (u.studioLightEnabled != 0);
     float3 finalRGB = needComposite ? mix(bgRGB, fgRGB, alpha) : fgRGB;
 
-    // 8. Whole-Composite Trilinear 3D Color LUT (grades foreground + background cohesively in 1 fetch!)
+    // 8. Whole-Composite Trilinear 3D Color LUT
     if (u.lutEnabled != 0 && u.lutDimension >= 2 && u.lutStrength > 0.001f) {
         float3 domRange = max(float3(1e-5f), u.lutDomainMax.rgb - u.lutDomainMin.rgb);
         float3 normRGB = saturate((finalRGB - u.lutDomainMin.rgb) / domRange);
         float dimF = float(u.lutDimension);
-        // Half-texel center mapping so identity .cube LUTs have 0.0000 black/white drift
         float3 lutCoord = normRGB * ((dimF - 1.0f) / dimF) + (0.5f / dimF);
         float3 gradedRGB = lutTex3D.sample(linSamp, lutCoord).rgb;
         finalRGB = mix(finalRGB, saturate(gradedRGB), saturate(u.lutStrength));
     }
 
-    // 9. Optional Reaction Overlay
+    // 9. Unified 35mm Film / Camera Sensor Grain (marries foreground + virtual BG sensor texture!)
+    if (u.filmGrainStrength > 0.005f) {
+        float2 seed = float2(gid) + float2(fract(u.timeSeconds * 24.0f) * 197.3f, fract(u.timeSeconds * 17.0f) * 311.7f);
+        float n = fract(sin(dot(seed, float2(12.9898f, 78.233f))) * 43758.5453f) - 0.5f;
+        float yFinal = rgbLuma(finalRGB);
+        float midtoneMask = 4.0f * yFinal * (1.0f - yFinal);
+        finalRGB = saturate(finalRGB + n * (0.065f * saturate(u.filmGrainStrength) * (0.30f + 0.70f * midtoneMask)));
+    }
+
+    // 10. Optional Reaction Overlay
     if (u.reactionType != 0) {
         finalRGB = applyReactionOverlay(finalRGB, dstUV, u.reactionType, u.reactionProgress, u.timeSeconds);
     }
 
-    // Write BGRA8Unorm -> Metal .bgra8Unorm swizzles float4(R, G, B, A) automatically!
     outBGRA.write(float4(saturate(finalRGB), 1.0f), gid);
 }
 
-// Fast Lanczos/Bilinear GPU scaler for feeding 1080p Virtual Camera Sink from 4K composited texture
+// GPU scaler (only invoked if an explicit 4K local override is simultaneously feeding a 1080p sink)
 kernel void scaleBGRAForSink(
     texture2d<float, access::sample> srcBGRA [[texture(0)]],
     texture2d<float, access::write>  dstBGRA [[texture(1)]],
@@ -416,7 +506,6 @@ kernel void scaleBGRAForSink(
     if (gid.x >= dstSize.x || gid.y >= dstSize.y) return;
     constexpr sampler linSamp(coord::normalized, address::clamp_to_edge, filter::linear);
     float2 uv = (float2(gid) + 0.5f) / float2(dstSize);
-    // 4-tap box-tent supersample for crisp 4K -> 1080p downscale
     float2 texel = 0.25f / float2(dstSize);
     float3 c = 0.25f * (
         srcBGRA.sample(linSamp, uv + float2(-texel.x, -texel.y)).rgb +

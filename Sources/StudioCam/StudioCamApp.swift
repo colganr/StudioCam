@@ -10,7 +10,7 @@ import CoreVideo
 struct StudioCamMain {
     static func main() {
         if CommandLine.arguments.contains("--benchmark") {
-            let exitCode = Headless4KBenchmark.run()
+            let exitCode = HeadlessStudioBenchmark.run()
             exit(exitCode)
         } else {
             StudioCamMenuApp.main()
@@ -27,6 +27,7 @@ struct StudioCamMenuApp: App {
                 ControlCenterMenuView(
                     pipeline: pipeline,
                     settings: appController.settings,
+                    prompter: pipeline.prompter,
                     onToggleCleanWindow: { appController.toggleCleanFeedWindow() }
                 )
             } else {
@@ -53,13 +54,13 @@ final class StudioCamAppController: ObservableObject {
         do {
             let p = try StudioPipeline(settings: settings)
             self.pipeline = p
-            seedBundled4KSampleVideosIfPresent(into: p)
+            seedBundledAssets(into: p)
         } catch {
             self.startupError = error.localizedDescription
         }
     }
 
-    private func seedBundled4KSampleVideosIfPresent(into pipeline: StudioPipeline) {
+    private func seedBundledAssets(into pipeline: StudioPipeline) {
         let appSupportSamples = LUTLoader.appSupportSubdirectory("SampleBackgrounds")
         let sampleDirs: [URL] = [
             Bundle.main.resourceURL?.appendingPathComponent("SampleBackgrounds"),
@@ -81,7 +82,6 @@ final class StudioCamAppController: ObservableObject {
         for sample in foundSamples.reversed() {
             settings.addRecentURL(sample)
         }
-        // Default to the first 4K sample video if the user hasn't picked a custom file yet
         if settings.customBackgroundURL == nil, let firstVideo = foundSamples.first {
             pipeline.selectCustomBackground(url: firstVideo)
         }
@@ -107,7 +107,7 @@ final class StudioCamAppController: ObservableObject {
             backing: .buffered,
             defer: false
         )
-        w.title = "StudioCam 4K Clean Feed"
+        w.title = "StudioCam Clean Feed"
         w.aspectRatio = NSSize(width: 16, height: 9)
         w.backgroundColor = .black
         w.contentView = NSHostingView(
@@ -132,73 +132,79 @@ final class StudioCamAppController: ObservableObject {
     }
 }
 
-/// Deterministic end-to-end 4K hardware benchmark:
-/// 1. Generates two real 3840x2160 4K HEVC sample looping background videos on Apple Media Engine (if not yet generated).
-/// 2. Decodes 4K HEVC via `BackgroundMediaController` (`AVPlayerLooper` + `IOSurface` NV12).
-/// 3. Runs `VNGeneratePersonSegmentationRequest` (ANE) + `MetalStudioCompositor` (4K Guided Filter + Temporal EMA +
-///    Spill Suppression + Studio Light + Edge Light + Portrait Bokeh + 4K Video Composite + 1080p Virtual Cam Sink scale).
-/// 4. Verifies `CMIOSinkBridge` zero-cert Virtual Camera connection and prints CPU/GPU/ANE latency metrics.
-enum Headless4KBenchmark {
+/// Deterministic end-to-end Apple Silicon v2.0 Benchmark:
+/// Tests BOTH:
+/// 1. Client-Matched 1080p Pipeline (Teams / Meet / OBS Virtual Cam native 1920x1080 — zero 4K downsample!)
+/// 2. Full 4K Creator Pipeline (3840x2160)
+/// With ALL v2.0 features enabled simultaneously: ANE 3D Scene-Depth Optical Bokeh (Real Room & Virtual Room),
+/// Optical Light Wrap, Ambient Room Color Match, Auto-Framing, Skin Polish, 35mm Film Grain, and 33³ .cube LUT.
+enum HeadlessStudioBenchmark {
     static func run() -> Int32 {
-        print("=== StudioCam 4K End-to-End Apple Silicon Benchmark ===")
+        print("=== StudioCam v2.0 End-to-End Apple Silicon Benchmark ===")
         do {
             let sampleDir = LUTLoader.appSupportSubdirectory("SampleBackgrounds")
-            try FileManager.default.createDirectory(at: sampleDir, withIntermediateDirectories: true)
-
             let sample1 = sampleDir.appendingPathComponent("Studio_Cyber_4K.mp4")
             let sample2 = sampleDir.appendingPathComponent("Warm_Tube_Lounge_4K.mp4")
 
             if !FileManager.default.fileExists(atPath: sample1.path) {
-                print("Generating 3840x2160 4K HEVC sample video 1: \(sample1.lastPathComponent)...")
                 try generate4KHEVCLoop(at: sample1, warmPalette: false)
             }
             if !FileManager.default.fileExists(atPath: sample2.path) {
-                print("Generating 3840x2160 4K HEVC sample video 2: \(sample2.lastPathComponent)...")
                 try generate4KHEVCLoop(at: sample2, warmPalette: true)
             }
 
             let compositor = try MetalStudioCompositor(shaderSourceFallback: StudioPipeline.loadShaderFallbackSource())
             print("Metal GPU Device: \(compositor.device.name)")
 
-            let bgController = BackgroundMediaController(device: compositor.device)
-            let loadSem = DispatchSemaphore(value: 0)
-            var loadedSummary = ""
-            bgController.loadMedia(from: sample1) { _, summary in
-                loadedSummary = summary
-                loadSem.signal()
-            }
-            _ = loadSem.wait(timeout: .now() + 10.0)
-            bgController.setPlaybackActive(true)
-            // Pump main runloop briefly so AVQueuePlayer prerolls Media Engine hardware decoder
-            RunLoop.main.run(until: Date().addingTimeInterval(0.45))
-            print("Loaded 4K Video Background: \(loadedSummary)")
+            let depthAnalyzer = SceneDepthAnalyzer(device: compositor.device)
+            let depthReadySem = DispatchSemaphore(value: 0)
+            depthAnalyzer.prepareModelAsync { _ in depthReadySem.signal() }
+            _ = depthReadySem.wait(timeout: .now() + 30.0)
+            print("Scene Depth Engine: \(depthAnalyzer.statusLabel)")
 
             let sampleLUTs = LUTLoader.ensureSampleLUTsExist()
             let loadedLUT = try LUTLoader.loadCubeLUT(from: sampleLUTs[0], device: compositor.device)
             compositor.setActiveLUT(loadedLUT)
-            print("Loaded 3D Color LUT: \(loadedLUT.title) (\(loadedLUT.dimension)×\(loadedLUT.dimension)×\(loadedLUT.dimension) .cube)")
+            print("3D Color LUT: \(loadedLUT.title) (\(loadedLUT.dimension)³ .cube)")
 
-            // Create synthetic 3840x2160 NV12 ('420v') IOSurface camera buffer with realistic silhouette
-            let camPB = try makeSynthetic4KNV12CameraFrame()
+            let sinkBridge = CMIOSinkBridge()
+            let (sinkOK, sinkMsg) = sinkBridge.start()
+            let clientDims = sinkOK ? sinkBridge.activeDimensions : (1920, 1080)
+            print("Client-Matched Virtual Camera Sink: ok=\(sinkOK) -> \(sinkMsg)")
+
             let seqHandler = VNSequenceRequestHandler()
             let segReq = VNGeneratePersonSegmentationRequest()
             segReq.qualityLevel = .balanced
             segReq.outputPixelFormat = kCVPixelFormatType_OneComponent8
 
-            // Also create a 3840x2160 static GPU texture for head-to-head comparison with 4K30 video
-            let staticDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm, width: 3840, height: 2160, mipmapped: false)
-            staticDesc.usage = [.shaderRead]
-            staticDesc.storageMode = .private
-            let staticTex = compositor.device.makeTexture(descriptor: staticDesc)!
+            func benchmarkPipeline(
+                label: String,
+                preset: CaptureResolutionPreset,
+                bgMode: BackgroundMode,
+                frames: Int = 60
+            ) throws {
+                let outDims = preset.resolvedDimensions(clientHint: clientDims)
+                let camPB = try makeSyntheticNV12CameraFrame(width: outDims.width, height: outDims.height)
 
-            func makeDailyDriverSnap(bgMode: BackgroundMode, lutEnabled: Bool) -> RenderSettingsSnapshot {
-                RenderSettingsSnapshot(
-                    resolution: .uhd4K,
+                let bgController = BackgroundMediaController(device: compositor.device)
+                bgController.setTargetDecodeDimensions(width: outDims.width, height: outDims.height)
+                if bgMode == .video {
+                    let sem = DispatchSemaphore(value: 0)
+                    bgController.loadMedia(from: sample1) { _, _ in sem.signal() }
+                    _ = sem.wait(timeout: .now() + 10.0)
+                    bgController.setPlaybackActive(true)
+                    RunLoop.main.run(until: Date().addingTimeInterval(0.35))
+                }
+
+                let snap = RenderSettingsSnapshot(
+                    resolution: preset,
                     segmentationQuality: .balancedANE,
                     backgroundMode: bgMode,
                     gradientPreset: StudioGradientPreset.presets[0],
                     portraitEnabled: true,
-                    portraitStrength: 0.55,
+                    portraitStrength: 0.65,
+                    depthBokehEnabled: true,
+                    focalPlaneOffset: 0.16,
                     studioLightEnabled: true,
                     studioLightStrength: 0.55,
                     edgeLightEnabled: false,
@@ -207,94 +213,109 @@ enum Headless4KBenchmark {
                     edgeLightWarmth: 0.35,
                     spillSuppression: 0.70,
                     edgeSoftness: 0.45,
+                    lightWrapStrength: 0.45,
+                    ambientMatchStrength: 0.35,
+                    autoFramingEnabled: false,
+                    autoFramingZoom: 1.20,
+                    skinPolishStrength: 0.25,
+                    filmGrainStrength: 0.14,
                     mirrorPreview: false,
                     reactionsGestureEnabled: false,
-                    virtualCamEnabled: true,
-                    lutEnabled: lutEnabled,
+                    virtualCamEnabled: sinkOK,
+                    lutEnabled: true,
                     lutStrength: 0.85,
                     activeReactionType: 0,
                     activeReactionStart: 0
                 )
-            }
 
-            // Warmup ANE & Metal pipelines (6 frames)
-            let warmSnap = makeDailyDriverSnap(bgMode: .video, lutEnabled: true)
-            for _ in 0..<6 {
-                let visionPB = compositor.makeVisionInputBuffer(from: camPB)
-                try seqHandler.perform([segReq], on: visionPB, orientation: .up)
-                let (vPB, _) = bgController.currentBackgroundFrame()
-                _ = compositor.renderFrame(
-                    cameraPixelBuffer: camPB,
-                    segmentationMaskBuffer: segReq.results?.first?.pixelBuffer,
-                    backgroundVideoBuffer: vPB,
-                    backgroundStaticTexture: staticTex,
-                    faceRect: SIMD4(0.5, 0.42, 0.16, 0.24),
-                    settings: warmSnap,
-                    produceSink: true
+                // Run initial one-shot ANE 3D scene depth on room or virtual room background!
+                let visionPB0 = compositor.makeVisionInputBuffer(from: camPB)
+                try seqHandler.perform([segReq], on: visionPB0, orientation: .up)
+                let (vPB0, _) = bgController.currentBackgroundFrame()
+                depthAnalyzer.maybeAnalyzeFrame(
+                    pixelBuffer: (bgMode == .video && vPB0 != nil) ? vPB0! : visionPB0,
+                    foregroundMaskToExclude: (bgMode == .none) ? segReq.results?.first?.pixelBuffer : nil,
+                    sourceToken: "bench:\(label)",
+                    forceImmediateSynchronous: true
                 )
-            }
 
-            let sinkBridge = CMIOSinkBridge()
-            let (sinkOK, sinkMsg) = sinkBridge.start()
-            print("Zero-Cert Virtual Camera Sink Test: ok=\(sinkOK) (\(sinkMsg))")
-            print("\n--- Daily-Driver Preset Benchmark (Portrait ON + Studio Light ON + Background ON @ 3840x2160) ---")
+                // Warmup 6 frames
+                for _ in 0..<6 {
+                    let vIn = compositor.makeVisionInputBuffer(from: camPB)
+                    try seqHandler.perform([segReq], on: vIn, orientation: .up)
+                    let (vPB, sTex) = bgController.currentBackgroundFrame()
+                    _ = compositor.renderFrame(
+                        outputDimensions: outDims,
+                        cameraPixelBuffer: camPB,
+                        segmentationMaskBuffer: segReq.results?.first?.pixelBuffer,
+                        backgroundVideoBuffer: vPB,
+                        backgroundStaticTexture: sTex,
+                        sceneDepthTexture: depthAnalyzer.depthTexture,
+                        faceRect: SIMD4(0.5, 0.42, 0.16, 0.24),
+                        cameraCropRect: SIMD4(0, 0, 1, 1),
+                        settings: snap,
+                        produceSink: sinkOK,
+                        sinkDimensions: clientDims
+                    )
+                }
 
-            func runProfile(_ name: String, snap: RenderSettingsSnapshot, frames: Int = 60) throws {
                 var cpuStart = rusage()
                 getrusage(RUSAGE_SELF, &cpuStart)
                 let wallStart = CACurrentMediaTime()
                 var aneTotalMs = 0.0
 
                 for i in 0..<frames {
-                    if snap.backgroundMode == .video && (i % 4 == 0) {
+                    if bgMode == .video && (i % 4 == 0) {
                         RunLoop.main.run(until: Date().addingTimeInterval(0.002))
                     }
                     let tANE0 = CACurrentMediaTime()
-                    let visionPB = compositor.makeVisionInputBuffer(from: camPB)
-                    try seqHandler.perform([segReq], on: visionPB, orientation: .up)
+                    let vIn = compositor.makeVisionInputBuffer(from: camPB)
+                    try seqHandler.perform([segReq], on: vIn, orientation: .up)
                     aneTotalMs += (CACurrentMediaTime() - tANE0) * 1000.0
 
-                    let (vPB, _) = bgController.currentBackgroundFrame()
+                    let (vPB, sTex) = bgController.currentBackgroundFrame()
                     if let res = compositor.renderFrame(
+                        outputDimensions: outDims,
                         cameraPixelBuffer: camPB,
                         segmentationMaskBuffer: segReq.results?.first?.pixelBuffer,
                         backgroundVideoBuffer: vPB,
-                        backgroundStaticTexture: staticTex,
+                        backgroundStaticTexture: sTex,
+                        sceneDepthTexture: depthAnalyzer.depthTexture,
                         faceRect: SIMD4(0.5, 0.42, 0.16, 0.24),
+                        cameraCropRect: SIMD4(0, 0, 1, 1),
                         settings: snap,
                         produceSink: sinkOK,
-                        sinkDimensions: sinkBridge.activeDimensions
+                        sinkDimensions: clientDims
                     ), sinkOK, let sPB = res.sinkPixelBuffer {
                         sinkBridge.enqueueFrame(sPB, fps: 30)
                     }
                 }
 
+                bgController.setPlaybackActive(false)
                 let wallSec = CACurrentMediaTime() - wallStart
                 var cpuEnd = rusage()
                 getrusage(RUSAGE_SELF, &cpuEnd)
-                let userSec = Double(cpuEnd.ru_utime.tv_sec - cpuStart.ru_utime.tv_sec)
-                    + Double(cpuEnd.ru_utime.tv_usec - cpuStart.ru_utime.tv_usec) / 1e6
-                let sysSec = Double(cpuEnd.ru_stime.tv_sec - cpuStart.ru_stime.tv_sec)
-                    + Double(cpuEnd.ru_stime.tv_usec - cpuStart.ru_stime.tv_usec) / 1e6
-                let estRealtime30CPU = ((userSec + sysSec) / (Double(frames) / 30.0)) * 100.0
+                let u = Double(cpuEnd.ru_utime.tv_sec - cpuStart.ru_utime.tv_sec) + Double(cpuEnd.ru_utime.tv_usec - cpuStart.ru_utime.tv_usec) / 1e6
+                let s = Double(cpuEnd.ru_stime.tv_sec - cpuStart.ru_stime.tv_sec) + Double(cpuEnd.ru_stime.tv_usec - cpuStart.ru_stime.tv_usec) / 1e6
+                let estCPU30 = ((u + s) / (Double(frames) / 30.0)) * 100.0
 
                 print(String(
-                    format: "%-38s | GPU: %.2f ms | ANE: %.2f ms | Max: %.1f FPS | 4K30 CPU: %.2f%% (1 core)",
-                    (name as NSString).utf8String!,
+                    format: "%-44s | %dx%d | GPU: %.2f ms | ANE: %.2f ms | Max: %.1f FPS | 30fps CPU: %.1f%% (1 core)",
+                    (label as NSString).utf8String!,
+                    outDims.width, outDims.height,
                     compositor.smoothedGPUMilliseconds,
                     aneTotalMs / Double(frames),
                     Double(frames) / wallSec,
-                    estRealtime30CPU
+                    estCPU30
                 ))
             }
 
-            try runProfile("A. Static 4K Image (No LUT)", snap: makeDailyDriverSnap(bgMode: .image, lutEnabled: false))
-            try runProfile("B. Static 4K Image + 33³ .cube LUT", snap: makeDailyDriverSnap(bgMode: .image, lutEnabled: true))
-            try runProfile("C. 4K30 HEVC Video (No LUT)", snap: makeDailyDriverSnap(bgMode: .video, lutEnabled: false))
-            try runProfile("D. 4K30 HEVC Video + 33³ .cube LUT", snap: makeDailyDriverSnap(bgMode: .video, lutEnabled: true))
+            print("\n--- All Standout v2.0 Effects Active (3D ANE Depth Bokeh + Light Wrap + Color Match + LUT + Grain + Skin Polish) ---")
+            try benchmarkPipeline(label: "1. Auto (Teams/Meet 1080p) Real Room Hallway", preset: .autoClient, bgMode: .none)
+            try benchmarkPipeline(label: "2. Auto (Teams/Meet 1080p) + Video Room BG", preset: .autoClient, bgMode: .video)
+            try benchmarkPipeline(label: "3. Explicit 4K UHD Creator + Video Room BG", preset: .uhd4K, bgMode: .video)
 
             sinkBridge.stop()
-            bgController.setPlaybackActive(false)
             return 0
         } catch {
             print("Benchmark failed: \(error)")
@@ -302,9 +323,7 @@ enum Headless4KBenchmark {
         }
     }
 
-    private static func makeSynthetic4KNV12CameraFrame() throws -> CVPixelBuffer {
-        let w = 3840
-        let h = 2160
+    private static func makeSyntheticNV12CameraFrame(width w: Int, height h: Int) throws -> CVPixelBuffer {
         let attrs: [CFString: Any] = [
             kCVPixelBufferIOSurfacePropertiesKey: [:],
             kCVPixelBufferMetalCompatibilityKey: true
@@ -326,7 +345,9 @@ enum Headless4KBenchmark {
                     let headDist = hypot((nx - 0.5) * 1.6, (ny - 0.38))
                     let torsoDist = hypot((nx - 0.5) * 0.95, (ny - 0.82) * 0.75)
                     let inPerson = (headDist < 0.16) || (torsoDist < 0.28)
-                    row[x] = inPerson ? UInt8(165) : UInt8(60)
+                    // Angled hallway luminance gradient behind person
+                    let hallwayWall = UInt8(min(220, max(35, Int(45.0 + abs(nx - 0.72) * 180.0))))
+                    row[x] = inPerson ? UInt8(170) : hallwayWall
                 }
             }
         }
@@ -341,16 +362,14 @@ enum Headless4KBenchmark {
         let w = 3840
         let h = 2160
         let fps: Int32 = 30
-        let totalFrames = 120 // 4.0s seamless cosine loop
+        let totalFrames = 120
 
         let writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
         let settings: [String: Any] = [
             AVVideoCodecKey: AVVideoCodecType.hevc,
             AVVideoWidthKey: w,
             AVVideoHeightKey: h,
-            AVVideoCompressionPropertiesKey: [
-                AVVideoAverageBitRateKey: 18_000_000
-            ]
+            AVVideoCompressionPropertiesKey: [AVVideoAverageBitRateKey: 18_000_000]
         ]
         let input = AVAssetWriterInput(mediaType: .video, outputSettings: settings)
         let adaptor = AVAssetWriterInputPixelBufferAdaptor(
@@ -400,7 +419,6 @@ enum Headless4KBenchmark {
             float3 col3 = warm ? float3(0.92f, 0.68f, 0.28f) : float3(0.12f, 0.80f, 0.76f);
 
             float3 rgb = base + col1 * g1 * 0.55f + col2 * g2 * 0.50f + col3 * g3 * 0.35f;
-            // Subtle architectural studio slats
             float slat = 0.94f + 0.06f * smoothstep(0.4f, 0.6f, sin(uv.x * 90.0f));
             rgb *= slat * (1.0f - 0.35f * dot(uv - 0.5f, uv - 0.5f));
             outTex.write(float4(saturate(rgb), 1.0f), gid);
@@ -410,9 +428,7 @@ enum Headless4KBenchmark {
         let pso = try dev.makeComputePipelineState(function: lib.makeFunction(name: "renderLoopBG")!)
 
         for f in 0..<totalFrames {
-            while !input.isReadyForMoreMediaData {
-                Thread.sleep(forTimeInterval: 0.003)
-            }
+            while !input.isReadyForMoreMediaData { Thread.sleep(forTimeInterval: 0.003) }
             var pbOpt: CVPixelBuffer?
             CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, adaptor.pixelBufferPool!, &pbOpt)
             guard let pb = pbOpt else { continue }

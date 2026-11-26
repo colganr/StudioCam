@@ -6,50 +6,52 @@ import IOSurface
 import QuartzCore
 import simd
 
-/// Matches `CompositeUniforms` in `StudioCamShaders.metal` byte-for-byte.
+/// Exact 224-byte 16-byte-aligned match to `CompositeUniforms` in `StudioCamShaders.metal`.
 private struct CompositeUniformsGPU {
-    var outputSize: SIMD2<UInt32>
-    var camSize: SIMD2<UInt32>
-    var bgSize: SIMD2<UInt32>
+    var outputSize: SIMD2<UInt32>          // 0
+    var camSize: SIMD2<UInt32>             // 8
+    var bgSize: SIMD2<UInt32>              // 16
+    var camIsYUV: UInt32                   // 24
+    var camFullRange: UInt32               // 28
 
-    var camIsYUV: UInt32
-    var camFullRange: UInt32
-    var bgMode: UInt32
-    var bgIsYUV: UInt32
+    var bgMode: UInt32                     // 32
+    var bgIsYUV: UInt32                    // 36
+    var portraitEnabled: UInt32            // 40
+    var portraitStrength: Float            // 44
 
-    var portraitEnabled: UInt32
-    var portraitStrength: Float
+    var depthBokehEnabled: UInt32          // 48
+    var focalPlaneOffset: Float            // 52
+    var studioLightEnabled: UInt32         // 56
+    var studioLightStrength: Float         // 60
 
-    var studioLightEnabled: UInt32
-    var studioLightStrength: Float
+    var edgeLightEnabled: UInt32           // 64
+    var edgeLightStrength: Float           // 68
+    var edgeLightWarmth: Float             // 72
+    var spillSuppression: Float            // 76
 
-    var edgeLightEnabled: UInt32
-    var edgeLightStrength: Float
-    var edgeLightWarmth: Float
+    var edgeSoftness: Float                // 80
+    var mirrorHorizontal: UInt32           // 84
+    var lightWrapStrength: Float           // 88
+    var ambientMatchStrength: Float        // 92
 
-    var spillSuppression: Float
-    var edgeSoftness: Float
-    var mirrorHorizontal: UInt32
-    var _alignPad: UInt32 = 0
+    var skinPolishStrength: Float          // 96
+    var filmGrainStrength: Float           // 100
+    var reactionType: UInt32               // 104
+    var reactionProgress: Float            // 108
 
-    var gradTopColor: SIMD4<Float>
-    var gradBottomColor: SIMD4<Float>
-    var faceRect: SIMD4<Float>
+    var timeSeconds: Float                 // 112
+    var lutStrength: Float                 // 116
+    var lutEnabled: UInt32                 // 120
+    var lutDimension: UInt32               // 124
 
-    var reactionType: UInt32
-    var reactionProgress: Float
-    var timeSeconds: Float
-    var lutStrength: Float
-
-    var lutEnabled: UInt32
-    var lutDimension: UInt32
-    var _lutPad0: UInt32 = 0
-    var _lutPad1: UInt32 = 0
-    var lutDomainMin: SIMD4<Float>
-    var lutDomainMax: SIMD4<Float>
+    var gradTopColor: SIMD4<Float>         // 128
+    var gradBottomColor: SIMD4<Float>      // 144
+    var faceRect: SIMD4<Float>             // 160
+    var camCropRect: SIMD4<Float>          // 176
+    var lutDomainMin: SIMD4<Float>         // 192
+    var lutDomainMax: SIMD4<Float>         // 208
 }
 
-/// Matches `GuidedUniforms` in `StudioCamShaders.metal` byte-for-byte.
 private struct GuidedUniformsGPU {
     var gridSize: SIMD2<UInt32>
     var radius: Int32
@@ -71,10 +73,10 @@ public final class MetalStudioCompositor {
     private let psoBoxV: MTLComputePipelineState
     private let psoSmoothAB: MTLComputePipelineState
     private let psoDownsampleHalf: MTLComputePipelineState
+    private let psoOpticalBokehDisc: MTLComputePipelineState
     private let psoComposite: MTLComputePipelineState
     private let psoScaleSink: MTLComputePipelineState
 
-    // Fixed low-res guided-filter intermediate textures (512x288 = < 2.5 MB total VRAM!)
     private let guideWidth = 512
     private let guideHeight = 288
     private var historyTexA: MTLTexture
@@ -87,15 +89,16 @@ public final class MetalStudioCompositor {
     private var abRawTex: MTLTexture
     private var abSmoothTex: MTLTexture
     private var dummy1x1Tex: MTLTexture
+    private var fallbackDepthTex: MTLTexture
     private var dummy3DLUTTex: MTLTexture
 
-    // Active 3D Color LUT state
     private let lutLock = NSLock()
     private var activeLUT: Loaded3DLUT?
 
-    // Half-res bokeh working textures (lazy/resized)
+    // Multi-stop optical bokeh working textures (960x540 nearBlur + 480x270 Golden-Angle farDiscBokeh)
     private var halfSrcTex: MTLTexture?
-    private var halfBlurTex: MTLTexture?
+    private var nearBlurTex: MTLTexture?
+    private var farBokehTex: MTLTexture?
     private var cachedBlurSigma: Float = -1
     private var gaussianBlur: MPSImageGaussianBlur?
 
@@ -128,10 +131,10 @@ public final class MetalStudioCompositor {
         CVMetalTextureCacheCreate(kCFAllocatorDefault, nil, dev, nil, &cache)
         self.textureCache = cache!
 
-        // Load precompiled default.metallib if bundled in .app, else compile embedded MSL once
         let lib: MTLLibrary
         if let metallibURL = Bundle.main.url(forResource: "default", withExtension: "metallib"),
-           let precompiled = try? dev.makeLibrary(URL: metallibURL) {
+           let precompiled = try? dev.makeLibrary(URL: metallibURL),
+           precompiled.makeFunction(name: "opticalBokehDiscPass") != nil {
             lib = precompiled
         } else {
             let opts = MTLCompileOptions()
@@ -151,6 +154,7 @@ public final class MetalStudioCompositor {
         self.psoBoxV = try makePSO("boxFilterVerticalAndCoeffs")
         self.psoSmoothAB = try makePSO("smoothGuidedCoeffs")
         self.psoDownsampleHalf = try makePSO("downsampleHalfBGRA")
+        self.psoOpticalBokehDisc = try makePSO("opticalBokehDiscPass")
         self.psoComposite = try makePSO("compositeStudioFrame")
         self.psoScaleSink = try makePSO("scaleBGRAForSink")
 
@@ -171,15 +175,33 @@ public final class MetalStudioCompositor {
         let d1 = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm, width: 1, height: 1, mipmapped: false)
         d1.usage = [.shaderRead]
         self.dummy1x1Tex = dev.makeTexture(descriptor: d1)!
-        var zero: UInt32 = 0xFF000000
+        var zero: UInt32 = 0xFF808080
         self.dummy1x1Tex.replace(region: MTLRegionMake2D(0, 0, 1, 1), mipmapLevel: 0, withBytes: &zero, bytesPerRow: 4)
+
+        // Smooth architectural perspective fallback depth map (in case ANE model is still compiling on frame 1)
+        let fbW = 64, fbH = 36
+        let dfb = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .r16Float, width: fbW, height: fbH, mipmapped: false)
+        dfb.usage = [.shaderRead]
+        let fbTex = dev.makeTexture(descriptor: dfb)!
+        self.fallbackDepthTex = fbTex
+        var fbPixels = [UInt16](repeating: 0, count: fbW * fbH)
+        for y in 0..<fbH {
+            let ny = Float(y) / Float(fbH - 1)
+            for x in 0..<fbW {
+                let nx = Float(x) / Float(fbW - 1)
+                let vpDist = hypot((nx - 0.5) * 1.2, (ny - 0.42))
+                let approxDepth = max(Float(0), min(Float(1), 1.0 - vpDist * 1.15))
+                fbPixels[y * fbW + x] = Float16(approxDepth).bitPattern
+            }
+        }
+        fbPixels.withUnsafeBytes { ptr in
+            fbTex.replace(region: MTLRegionMake2D(0, 0, fbW, fbH), mipmapLevel: 0, withBytes: ptr.baseAddress!, bytesPerRow: fbW * 2)
+        }
 
         let d3 = MTLTextureDescriptor()
         d3.textureType = .type3D
         d3.pixelFormat = .rgba16Float
-        d3.width = 2
-        d3.height = 2
-        d3.depth = 2
+        d3.width = 2; d3.height = 2; d3.depth = 2
         d3.usage = [.shaderRead]
         self.dummy3DLUTTex = dev.makeTexture(descriptor: d3)!
     }
@@ -194,9 +216,6 @@ public final class MetalStudioCompositor {
         hasHistory = false
     }
 
-    /// Downscales a 4K/1080p camera IOSurface to a 640x360 IOSurface on Metal (< 0.12 ms, 0% CPU)
-    /// so Vision's ANE person-segmentation & face-tracking never run an 8.3 MP CPU vImage downscale.
-    /// Full 3840x2160 hair detail is still recovered in `compositeStudioFrame` via the 4K luma guided filter!
     public func makeVisionInputBuffer(from cameraPixelBuffer: CVPixelBuffer) -> CVPixelBuffer {
         let w = CVPixelBufferGetWidth(cameraPixelBuffer)
         let h = CVPixelBufferGetHeight(cameraPixelBuffer)
@@ -243,17 +262,20 @@ public final class MetalStudioCompositor {
     }
 
     public func renderFrame(
+        outputDimensions: (width: Int, height: Int),
         cameraPixelBuffer: CVPixelBuffer,
         segmentationMaskBuffer: CVPixelBuffer?,
         backgroundVideoBuffer: CVPixelBuffer?,
         backgroundStaticTexture: MTLTexture?,
+        sceneDepthTexture: MTLTexture?,
         faceRect: SIMD4<Float>,
+        cameraCropRect: SIMD4<Float>,
         settings: RenderSettingsSnapshot,
         produceSink: Bool,
         sinkDimensions: (width: Int, height: Int) = (1920, 1080)
     ) -> RenderResult? {
-        let outW = settings.resolution.width
-        let outH = settings.resolution.height
+        let outW = outputDimensions.width
+        let outH = outputDimensions.height
 
         guard let outPB = allocateFromMainPool(width: outW, height: outH),
               let outTex = makeBGRAWriteTexture(from: outPB) else {
@@ -266,7 +288,7 @@ public final class MetalStudioCompositor {
 
         guard let cmd = commandQueue.makeCommandBuffer() else { return nil }
 
-        // 1. Guided-Filter Hair Matte + Color-Similarity Temporal EMA (if any segmentation consumer is active)
+        // 1. Guided-Filter Hair Matte + Color-Similarity Temporal EMA
         let needsMask = (settings.backgroundMode != .none) || settings.portraitEnabled || settings.studioLightEnabled || settings.edgeLightEnabled
         if needsMask, let maskPB = segmentationMaskBuffer, let maskTex = makeSinglePlaneR8Texture(from: maskPB) {
             let prevHist = pingHistoryToggle ? historyTexB : historyTexA
@@ -356,11 +378,21 @@ public final class MetalStudioCompositor {
             }
         }
 
-        // 3. Optional Portrait Optical Bokeh (runs at 960x540 via MPSImageGaussianBlur -> < 0.18 ms GPU!)
-        var blurredResultTex: MTLTexture = dummy1x1Tex
-        if settings.portraitEnabled && settings.portraitStrength > 0.01 && effectiveBGMode != .gradient {
-            ensureHalfBokehTextures(width: 960, height: 540, sigma: 4.0 + 18.0 * settings.portraitStrength)
-            if let hSrc = halfSrcTex, let hBlur = halfBlurTex, let mpsBlur = gaussianBlur {
+        // 3. Multi-Stop Optical Bokeh + Light Wrap / Ambient Pyramid (960x540 Near Blur + 480x270 Golden-Angle Far Disc Bokeh)
+        var nearOutTex: MTLTexture = dummy1x1Tex
+        var farOutTex: MTLTexture = dummy1x1Tex
+        let needsPyramid = (effectiveBGMode != .gradient) && (
+            (settings.portraitEnabled && settings.portraitStrength > 0.01) ||
+            (effectiveBGMode != .none && (settings.lightWrapStrength > 0.01 || settings.ambientMatchStrength > 0.01))
+        )
+
+        if needsPyramid {
+            let nearSigma: Float = settings.depthBokehEnabled
+                ? (2.5 + 5.5 * settings.portraitStrength)
+                : (4.0 + 18.0 * settings.portraitStrength)
+            ensureBokehPyramidTextures(sigma: nearSigma)
+
+            if let hSrc = halfSrcTex, let nBlur = nearBlurTex, let fBokeh = farBokehTex, let mpsBlur = gaussianBlur {
                 if let enc = cmd.makeComputeCommandEncoder() {
                     enc.setComputePipelineState(psoDownsampleHalf)
                     if effectiveBGMode == .none {
@@ -379,12 +411,28 @@ public final class MetalStudioCompositor {
                                         threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1))
                     enc.endEncoding()
                 }
-                mpsBlur.encode(commandBuffer: cmd, sourceTexture: hSrc, destinationTexture: hBlur)
-                blurredResultTex = hBlur
+                mpsBlur.encode(commandBuffer: cmd, sourceTexture: hSrc, destinationTexture: nBlur)
+                nearOutTex = nBlur
+
+                if (settings.portraitEnabled && settings.depthBokehEnabled) || settings.ambientMatchStrength > 0.01 {
+                    if let enc = cmd.makeComputeCommandEncoder() {
+                        var rad = settings.portraitStrength
+                        enc.setComputePipelineState(psoOpticalBokehDisc)
+                        enc.setTexture(nBlur, index: 0)
+                        enc.setTexture(fBokeh, index: 1)
+                        enc.setBytes(&rad, length: MemoryLayout<Float>.stride, index: 0)
+                        enc.dispatchThreads(MTLSize(width: fBokeh.width, height: fBokeh.height, depth: 1),
+                                            threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1))
+                        enc.endEncoding()
+                    }
+                    farOutTex = fBokeh
+                } else {
+                    farOutTex = nBlur
+                }
             }
         }
 
-        // 4. Reaction animation progress
+        // 4. Reaction progress
         let now = CACurrentMediaTime()
         var rType = settings.activeReactionType
         var rProg: Float = 0
@@ -397,13 +445,14 @@ public final class MetalStudioCompositor {
             }
         }
 
-        // 5. Fused Single-Pass 4K Composite (+ Trilinear 3D LUT)
+        // 5. Fused Single-Pass Composite (at exact client-requested resolution!)
         lutLock.lock()
         let currentLUT = activeLUT
         lutLock.unlock()
 
         let useLUT = settings.lutEnabled && (currentLUT != nil)
         let lutTex = currentLUT?.texture ?? dummy3DLUTTex
+        let depthTex = sceneDepthTexture ?? fallbackDepthTex
 
         var cu = CompositeUniformsGPU(
             outputSize: SIMD2(UInt32(outW), UInt32(outH)),
@@ -415,6 +464,8 @@ public final class MetalStudioCompositor {
             bgIsYUV: bgIsYUV ? 1 : 0,
             portraitEnabled: settings.portraitEnabled ? 1 : 0,
             portraitStrength: settings.portraitStrength,
+            depthBokehEnabled: settings.depthBokehEnabled ? 1 : 0,
+            focalPlaneOffset: settings.focalPlaneOffset,
             studioLightEnabled: settings.studioLightEnabled ? 1 : 0,
             studioLightStrength: settings.studioLightStrength,
             edgeLightEnabled: settings.edgeLightEnabled ? 1 : 0,
@@ -423,15 +474,20 @@ public final class MetalStudioCompositor {
             spillSuppression: settings.spillSuppression,
             edgeSoftness: settings.edgeSoftness,
             mirrorHorizontal: settings.mirrorPreview ? 1 : 0,
-            gradTopColor: settings.gradientPreset.topRGB,
-            gradBottomColor: settings.gradientPreset.bottomRGB,
-            faceRect: faceRect,
+            lightWrapStrength: settings.lightWrapStrength,
+            ambientMatchStrength: settings.ambientMatchStrength,
+            skinPolishStrength: settings.skinPolishStrength,
+            filmGrainStrength: settings.filmGrainStrength,
             reactionType: rType,
             reactionProgress: rProg,
             timeSeconds: Float(fmod(now, 1000.0)),
             lutStrength: settings.lutStrength,
             lutEnabled: useLUT ? 1 : 0,
             lutDimension: currentLUT?.dimension ?? 0,
+            gradTopColor: settings.gradientPreset.topRGB,
+            gradBottomColor: settings.gradientPreset.bottomRGB,
+            faceRect: faceRect,
+            camCropRect: cameraCropRect,
             lutDomainMin: currentLUT?.domainMin ?? SIMD4<Float>(0, 0, 0, 0),
             lutDomainMax: currentLUT?.domainMax ?? SIMD4<Float>(1, 1, 1, 1)
         )
@@ -443,9 +499,11 @@ public final class MetalStudioCompositor {
             enc.setTexture(abSmoothTex, index: 2)
             enc.setTexture(bgPlane0, index: 3)
             enc.setTexture(bgPlane1, index: 4)
-            enc.setTexture(blurredResultTex, index: 5)
+            enc.setTexture(nearOutTex, index: 5)
             enc.setTexture(outTex, index: 6)
             enc.setTexture(lutTex, index: 7)
+            enc.setTexture(farOutTex, index: 8)
+            enc.setTexture(depthTex, index: 9)
             enc.setBytes(&cu, length: MemoryLayout<CompositeUniformsGPU>.stride, index: 0)
             enc.dispatchThreads(
                 MTLSize(width: outW, height: outH, depth: 1),
@@ -454,7 +512,8 @@ public final class MetalStudioCompositor {
             enc.endEncoding()
         }
 
-        // 6. Optional Virtual Camera Sink Buffer (zero-copy if resolution matches, else GPU supersampled!)
+        // 6. Virtual Camera Sink Output:
+        // In Auto (Match App) or 1080p mode, outW==sW && outH==sH -> 100% ZERO-COPY (`sinkPBOut = outPB`)!
         var sinkPBOut: CVPixelBuffer? = nil
         if produceSink {
             let sW = max(2, sinkDimensions.width)
@@ -494,7 +553,7 @@ public final class MetalStudioCompositor {
         return RenderResult(mainPixelBuffer: outPB, mainTexture: outTex, sinkPixelBuffer: sinkPBOut)
     }
 
-    // MARK: - Zero-Copy CVMetalTextureCache Helpers
+    // MARK: - Helpers
 
     private func camPlane0OrSecond(_ tex: MTLTexture?) -> MTLTexture {
         tex ?? dummy1x1Tex
@@ -512,9 +571,7 @@ public final class MetalStudioCompositor {
             var uvRef: CVMetalTexture?
             CVMetalTextureCacheCreateTextureFromImage(kCFAllocatorDefault, textureCache, pb, nil, .r8Unorm, yW, yH, 0, &yRef)
             CVMetalTextureCacheCreateTextureFromImage(kCFAllocatorDefault, textureCache, pb, nil, .rg8Unorm, uvW, uvH, 1, &uvRef)
-            let yTex = yRef.flatMap { CVMetalTextureGetTexture($0) }
-            let uvTex = uvRef.flatMap { CVMetalTextureGetTexture($0) }
-            return (yTex, uvTex, true, fmt == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange)
+            return (yRef.flatMap { CVMetalTextureGetTexture($0) }, uvRef.flatMap { CVMetalTextureGetTexture($0) }, true, fmt == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange)
         } else {
             let w = CVPixelBufferGetWidth(pb)
             let h = CVPixelBufferGetHeight(pb)
@@ -543,13 +600,18 @@ public final class MetalStudioCompositor {
         return ref.flatMap { CVMetalTextureGetTexture($0) }
     }
 
-    private func ensureHalfBokehTextures(width: Int, height: Int, sigma: Float) {
-        if halfSrcTex?.width != width || halfSrcTex?.height != height {
-            let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm, width: width, height: height, mipmapped: false)
-            d.usage = [.shaderRead, .shaderWrite]
-            d.storageMode = .private
-            halfSrcTex = device.makeTexture(descriptor: d)
-            halfBlurTex = device.makeTexture(descriptor: d)
+    private func ensureBokehPyramidTextures(sigma: Float) {
+        if halfSrcTex == nil {
+            let dHalf = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm, width: 960, height: 540, mipmapped: false)
+            dHalf.usage = [.shaderRead, .shaderWrite]
+            dHalf.storageMode = .private
+            halfSrcTex = device.makeTexture(descriptor: dHalf)
+            nearBlurTex = device.makeTexture(descriptor: dHalf)
+
+            let dQuarter = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm, width: 480, height: 270, mipmapped: false)
+            dQuarter.usage = [.shaderRead, .shaderWrite]
+            dQuarter.storageMode = .private
+            farBokehTex = device.makeTexture(descriptor: dQuarter)
         }
         if abs(cachedBlurSigma - sigma) > 0.35 {
             cachedBlurSigma = sigma

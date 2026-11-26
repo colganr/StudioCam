@@ -19,10 +19,20 @@ public final class CMIOSinkBridge {
 
     private let lock = NSLock()
     private var activeTarget: SinkTarget?
+    private var formatListenerStreamID: CMIOStreamID = 0
+    private var formatListenerBlock: CMIOObjectPropertyListenerBlock?
+    public var onActiveFormatChanged: (((Int, Int)) -> Void)?
+
     public var activeDimensions: (width: Int, height: Int) {
         lock.lock()
-        defer { lock.unlock() }
-        return (activeTarget?.width ?? 1920, activeTarget?.height ?? 1080)
+        let streamID = activeTarget?.streamID
+        let fallback = (activeTarget?.width ?? 1920, activeTarget?.height ?? 1080)
+        lock.unlock()
+        if let st = streamID {
+            let live = Self.queryActiveOrPreferredStreamDimensions(streamID: st)
+            if live.0 > 0 && live.1 > 0 { return live }
+        }
+        return fallback
     }
     private var bufferQueue: CMSimpleQueue?
     private var formatDescription: CMVideoFormatDescription?
@@ -83,7 +93,7 @@ public final class CMIOSinkBridge {
                 var dir: UInt32 = 99
                 var dSz = UInt32(MemoryLayout<UInt32>.size)
                 if CMIOObjectGetPropertyData(st, &dProp, 0, nil, dSz, &dSz, &dir) == noErr, dir == 0 {
-                    let (sw, sh) = queryPreferredStreamDimensions(streamID: st)
+                    let (sw, sh) = queryActiveOrPreferredStreamDimensions(streamID: st)
                     found.append(SinkTarget(deviceID: dev, streamID: st, name: devName, width: sw, height: sh))
                 }
             }
@@ -97,7 +107,27 @@ public final class CMIOSinkBridge {
         }
     }
 
-    private static func queryPreferredStreamDimensions(streamID: CMIOStreamID) -> (Int, Int) {
+    /// Queries the stream's currently negotiated format (`kCMIOStreamPropertyFormatDescription`) first
+    /// so we match the exact resolution requested by Teams / Meet / Zoom / OBS (e.g. 1080p or 720p)
+    /// without initializing a wasted 4K capture/downsample pipeline.
+    public static func queryActiveOrPreferredStreamDimensions(streamID: CMIOStreamID) -> (Int, Int) {
+        var activeProp = CMIOObjectPropertyAddress(
+            mSelector: CMIOObjectPropertySelector(kCMIOStreamPropertyFormatDescription),
+            mScope: CMIOObjectPropertyScope(kCMIOObjectPropertyScopeGlobal),
+            mElement: CMIOObjectPropertyElement(kCMIOObjectPropertyElementMain)
+        )
+        var activeFmt: CMFormatDescription? = nil
+        var aSz = UInt32(MemoryLayout<CMFormatDescription?>.size)
+        let aStatus = withUnsafeMutablePointer(to: &activeFmt) { ptr in
+            CMIOObjectGetPropertyData(streamID, &activeProp, 0, nil, aSz, &aSz, ptr)
+        }
+        if aStatus == noErr, let fmt = activeFmt {
+            let d = CMVideoFormatDescriptionGetDimensions(fmt)
+            if d.width > 0 && d.height > 0 {
+                return (Int(d.width), Int(d.height))
+            }
+        }
+
         var fProp = CMIOObjectPropertyAddress(
             mSelector: CMIOObjectPropertySelector(kCMIOStreamPropertyFormatDescriptions),
             mScope: CMIOObjectPropertyScope(kCMIOObjectPropertyScopeGlobal),
@@ -108,10 +138,8 @@ public final class CMIOSinkBridge {
         _ = withUnsafeMutablePointer(to: &fmts) { ptr in
             CMIOObjectGetPropertyData(streamID, &fProp, 0, nil, fSz, &fSz, ptr)
         }
-        if let arr = fmts as? [CMFormatDescription], let best = arr.max(by: {
-            CMVideoFormatDescriptionGetDimensions($0).width < CMVideoFormatDescriptionGetDimensions($1).width
-        }) {
-            let d = CMVideoFormatDescriptionGetDimensions(best)
+        if let arr = fmts as? [CMFormatDescription], let first = arr.first {
+            let d = CMVideoFormatDescriptionGetDimensions(first)
             if d.width > 0 && d.height > 0 {
                 return (Int(d.width), Int(d.height))
             }
@@ -147,12 +175,14 @@ public final class CMIOSinkBridge {
         self.formatDescription = nil
         self.sequenceNumber = 0
         self.isStarted = true
-        return (true, chosen.name)
+        installFormatChangeListener(streamID: chosen.streamID)
+        let live = Self.queryActiveOrPreferredStreamDimensions(streamID: chosen.streamID)
+        return (true, "\(chosen.name) (\(live.0)×\(live.1))")
     }
 
     public func stop() {
         lock.lock()
-        defer { lock.unlock() }
+        removeFormatChangeListenerLocked()
         if isStarted, let t = activeTarget {
             _ = CMIODeviceStopStream(t.deviceID, t.streamID)
         }
@@ -160,6 +190,40 @@ public final class CMIOSinkBridge {
         bufferQueue = nil
         activeTarget = nil
         formatDescription = nil
+        lock.unlock()
+    }
+
+    private func installFormatChangeListener(streamID: CMIOStreamID) {
+        removeFormatChangeListenerLocked()
+        var addr = CMIOObjectPropertyAddress(
+            mSelector: CMIOObjectPropertySelector(kCMIOStreamPropertyFormatDescription),
+            mScope: CMIOObjectPropertyScope(kCMIOObjectPropertyScopeGlobal),
+            mElement: CMIOObjectPropertyElement(kCMIOObjectPropertyElementMain)
+        )
+        let block: CMIOObjectPropertyListenerBlock = { [weak self] _, _ in
+            guard let self = self else { return }
+            let dims = Self.queryActiveOrPreferredStreamDimensions(streamID: streamID)
+            self.lock.lock()
+            self.formatDescription = nil
+            self.lock.unlock()
+            self.onActiveFormatChanged?(dims)
+        }
+        CMIOObjectAddPropertyListenerBlock(streamID, &addr, DispatchQueue.main, block)
+        formatListenerStreamID = streamID
+        formatListenerBlock = block
+    }
+
+    private func removeFormatChangeListenerLocked() {
+        if formatListenerStreamID != 0, let block = formatListenerBlock {
+            var addr = CMIOObjectPropertyAddress(
+                mSelector: CMIOObjectPropertySelector(kCMIOStreamPropertyFormatDescription),
+                mScope: CMIOObjectPropertyScope(kCMIOObjectPropertyScopeGlobal),
+                mElement: CMIOObjectPropertyElement(kCMIOObjectPropertyElementMain)
+            )
+            CMIOObjectRemovePropertyListenerBlock(formatListenerStreamID, &addr, DispatchQueue.main, block)
+        }
+        formatListenerStreamID = 0
+        formatListenerBlock = nil
     }
 
     public func enqueueFrame(_ pixelBuffer: CVPixelBuffer, fps: Int32 = 30) {
