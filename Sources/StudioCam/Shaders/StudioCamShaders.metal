@@ -45,7 +45,7 @@ struct CompositeUniforms {
     float4 camCropRect;        // 176: [originX, originY, widthFrac, heightFrac] for lossless Auto-Framing
     float4 lutDomainMin;       // 192
     float4 lutDomainMax;       // 208
-    float4 matteTuning;        // 224: x=matteChoke (-0.25..0.25), y=temporalStability (0..1), z=unused, w=unused
+    float4 matteTuning;        // 224: x=matteChoke (-0.25..0.25), y=temporalStability (0..1), z=camGammaPower (1.0 or 1.12), w=unused
 };
 
 struct GuidedUniforms {
@@ -60,9 +60,11 @@ struct GuidedUniforms {
 };
 
 inline float3 yuvToRGB(float ySample, float2 cbcrSample, bool fullRange) {
-    float y = fullRange ? ySample : ((ySample - (16.0f / 255.0f)) * (255.0f / 219.0f));
-    float cb = cbcrSample.x - 0.5f;
-    float cr = cbcrSample.y - 0.5f;
+    // Exact ITU-R BT.709 Y'CbCr -> R'G'B' conversion with proper 255/224 video-range chroma expansion
+    // (previously missing 255/224 desaturated skin chroma by ~14% and washed out warm skin into pale pink).
+    float y  = fullRange ? ySample : ((ySample - (16.0f / 255.0f)) * (255.0f / 219.0f));
+    float cb = fullRange ? (cbcrSample.x - (128.0f / 255.0f)) : ((cbcrSample.x - (128.0f / 255.0f)) * (255.0f / 224.0f));
+    float cr = fullRange ? (cbcrSample.y - (128.0f / 255.0f)) : ((cbcrSample.y - (128.0f / 255.0f)) * (255.0f / 224.0f));
     float r = y + 1.5748f * cr;
     float g = y - 0.1873f * cb - 0.4681f * cr;
     float b = y + 1.8556f * cb;
@@ -379,6 +381,12 @@ kernel void compositeStudioFrame(
     } else {
         fgRGB = camPlane0.sample(linSamp, camUV).rgb;
     }
+    // Match macOS ColorSync camera-transfer conversion (SMPTE_240M / Rec.709 ~1.96 -> sRGB 2.2)
+    // so untagged BGRA virtual-cam output matches native Facecam exposure & shadow richness!
+    float camGamma = max(0.85f, min(1.30f, u.matteTuning.z));
+    if (fabs(camGamma - 1.0f) > 0.005f) {
+        fgRGB = pow(max(fgRGB, float3(1e-5f)), float3(camGamma));
+    }
     float fgLuma = rgbLuma(fgRGB);
 
     // 2. Hybrid RGB Joint-Bilateral + Clamped Luma Guided Hair Matte
@@ -490,9 +498,9 @@ kernel void compositeStudioFrame(
         }
     }
 
-    // 4. Hair Color-Spill Suppression + Live Ambient Color Match + Optical Light Wrap
+    // 4. Hair Color-Spill Suppression + Luminance-Neutral Ambient Color Match + Highlight-Safe Optical Light Wrap
     if (u.bgMode != 0) {
-        // 4a. Live Ambient Room Color Match (nudges subject tint to match virtual room lighting dynamically)
+        // 4a. Luminance-Neutral Ambient Room Color Match (nudges color temperature without ever raising exposure or clipping highlights!)
         if (u.ambientMatchStrength > 0.01f && alpha > 0.05f) {
             float3 roomAmb = (u.bgMode == 1)
                 ? 0.5f * (u.gradTopColor.rgb + u.gradBottomColor.rgb)
@@ -503,8 +511,13 @@ kernel void compositeStudioFrame(
                     farBokehTex.sample(linSamp, float2(0.75f, 0.65f)).rgb
                 );
             float ambLuma = max(0.08f, rgbLuma(roomAmb));
-            float3 ambTint = clamp(roomAmb / ambLuma, float3(0.78f), float3(1.26f));
-            fgRGB = saturate(fgRGB * mix(float3(1.0f), ambTint, saturate(u.ambientMatchStrength) * 0.28f));
+            float3 ambTint = clamp(roomAmb / ambLuma, float3(0.84f), float3(1.16f));
+            float3 tinted = fgRGB * mix(float3(1.0f), ambTint, saturate(u.ambientMatchStrength) * 0.24f);
+            float tintedLuma = max(1e-4f, rgbLuma(tinted));
+            float maxT = max(tinted.r, max(tinted.g, tinted.b));
+            float safeGain = min(fgLuma / tintedLuma, 0.99f / max(0.99f, maxT));
+            fgRGB = saturate(tinted * safeGain);
+            fgLuma = rgbLuma(fgRGB);
         }
 
         // 4b. Semi-transparent hair spill suppression
@@ -516,27 +529,38 @@ kernel void compositeStudioFrame(
             fgRGB = mix(fgRGB, ambientTintedFG, edgeBand * u.spillSuppression * 0.65f);
         }
 
-        // 4c. Optical Light Wrap (bleeds bright virtual background glow softly over subject rim!)
+        // 4c. Highlight-Safe Screen-Mode Optical Light Wrap (bleeds bright BG softly without ever clipping hands/fingers!)
         if (u.lightWrapStrength > 0.01f && alpha > 0.10f) {
             float3 localBGGlow = (u.bgMode == 1) ? bgRGB : nearBlurTex.sample(linSamp, activeSceneUV).rgb;
             float glowEnergy = smoothstep(0.25f, 0.95f, rgbLuma(localBGGlow));
-            float rimWrap = (1.0f - smoothstep(0.30f, 0.98f, alpha)) * smoothstep(0.05f, 0.45f, alpha);
-            fgRGB = saturate(fgRGB + localBGGlow * (glowEnergy * rimWrap * saturate(u.lightWrapStrength) * 0.55f));
+            float rimWrap = (1.0f - smoothstep(0.30f, 0.95f, alpha)) * smoothstep(0.05f, 0.45f, alpha);
+            float maxFG = max(fgRGB.r, max(fgRGB.g, fgRGB.b));
+            float wrapGuard = 1.0f - smoothstep(0.55f, 0.88f, maxFG);
+            fgRGB = saturate(fgRGB + localBGGlow * (1.0f - fgRGB) * (glowEnergy * rimWrap * wrapGuard * saturate(u.lightWrapStrength) * 0.36f));
         }
     }
 
-    // 5. Studio Light (SRLv2 contour lift + background dimming)
+    // 5. Highlight-Protected Studio Light (modeled on Apple Portrait.framework SRLv2)
+    // Achieves subject separation via clean background dimming + vignette (~0.56x) and shadow-only key lift
+    // with strict per-channel highlight protection so bright cheeks, palms, and fingers NEVER blow out or clip red!
     if (u.studioLightEnabled != 0 && u.studioLightStrength > 0.001f) {
         float s = saturate(u.studioLightStrength);
-        bgRGB *= mix(1.0f, 0.74f, s);
+        float2 bgCentered = (dstUV - 0.5f) * float2(1.35f, 1.0f);
+        float bgVig = clamp(1.0f - 0.20f * s * dot(bgCentered, bgCentered), 0.72f, 1.0f);
+        bgRGB *= mix(1.0f, 0.56f, s) * bgVig;
 
         float2 faceCenter = u.faceRect.xy;
         if (u.mirrorHorizontal != 0) faceCenter.x = 1.0f - faceCenter.x;
         float2 radii = max(u.faceRect.zw, float2(0.18f, 0.28f));
-        float2 d = (dstUV - faceCenter) / (radii * 1.65f);
+        float2 d = (dstUV - faceCenter) / (radii * 1.55f);
         float keyFalloff = exp(-0.5f * dot(d, d));
-        float shadowLift = (1.0f - fgLuma) * fgLuma * 4.0f;
-        fgRGB = saturate(fgRGB + fgRGB * (0.28f * s * keyFalloff * (0.45f + 0.55f * shadowLift)));
+
+        float maxCh = max(fgRGB.r, max(fgRGB.g, fgRGB.b));
+        // Taper key boost cleanly to 0 before any channel reaches highlight territory (0.42..0.78)
+        float highlightGuard = 1.0f - smoothstep(0.42f, 0.78f, maxCh);
+        float shadowCurve = (1.0f - fgLuma) * smoothstep(0.02f, 0.28f, fgLuma);
+        float liftFactor = 0.20f * s * keyFalloff * highlightGuard * (0.35f + 0.65f * shadowCurve);
+        fgRGB = saturate(fgRGB * (1.0f + liftFactor));
     }
 
     // 6. Edge Light

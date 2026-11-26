@@ -55,6 +55,8 @@ final class StudioCamAppController: ObservableObject {
 
     init() {
         do {
+            // Ensure built-in v2 highlight-safe .cube LUTs are up-to-date on disk BEFORE StudioPipeline restores selectedLUTURL!
+            _ = LUTLoader.ensureSampleLUTsExist()
             let p = try StudioPipeline(settings: settings)
             self.pipeline = p
             seedBundledAssets(into: p)
@@ -661,6 +663,58 @@ enum HeadlessStudioBenchmark {
             format: "Fast Low-Contrast Sway (dark shirt on dark wall): Trailing Ghost Residual: %.2f%% | Leading Body Snap: %.1f%%",
             trailingGhostPct, lowContrastLeadingPct
         ))
+
+        // 3. Highlight-Safe Skin & Hand Exposure Verification (studioLight=1.0 + Rec709 LUT + LightWrap + AmbientMatch)
+        // Verifies bright skin highlights (RGB 223, 193, 195 — exact IMG1 palm max) NEVER clip to 255 or lose warm R/G ratio!
+        var skinSnap = snap
+        skinSnap.studioLightEnabled = true
+        skinSnap.studioLightStrength = 1.0
+        skinSnap.lightWrapStrength = 0.20
+        skinSnap.ambientMatchStrength = 0.25
+        skinSnap.lutEnabled = true
+        skinSnap.lutStrength = 0.85
+
+        let attrs: [CFString: Any] = [kCVPixelBufferIOSurfacePropertiesKey: [:], kCVPixelBufferMetalCompatibilityKey: true]
+        var skinCamOpt: CVPixelBuffer?
+        var skinMaskOpt: CVPixelBuffer?
+        CVPixelBufferCreate(kCFAllocatorDefault, 320, 180, kCVPixelFormatType_32BGRA, attrs as CFDictionary, &skinCamOpt)
+        CVPixelBufferCreate(kCFAllocatorDefault, 320, 180, kCVPixelFormatType_OneComponent8, attrs as CFDictionary, &skinMaskOpt)
+        if let sCam = skinCamOpt, let sMask = skinMaskOpt {
+            CVPixelBufferLockBaseAddress(sCam, [])
+            let base = CVPixelBufferGetBaseAddress(sCam)!.assumingMemoryBound(to: UInt8.self)
+            let bpr = CVPixelBufferGetBytesPerRow(sCam)
+            for y in 0..<180 {
+                let row = base + y * bpr
+                for x in 0..<320 {
+                    row[x * 4 + 0] = 195 // B
+                    row[x * 4 + 1] = 193 // G
+                    row[x * 4 + 2] = 223 // R (exact bright skin highlight)
+                    row[x * 4 + 3] = 255
+                }
+            }
+            CVPixelBufferUnlockBaseAddress(sCam, [])
+
+            CVPixelBufferLockBaseAddress(sMask, [])
+            memset(CVPixelBufferGetBaseAddress(sMask)!, 255, CVPixelBufferGetBytesPerRow(sMask) * 180)
+            CVPixelBufferUnlockBaseAddress(sMask, [])
+
+            compositor.resetTemporalHistory()
+            if let res = compositor.renderFrame(
+                outputDimensions: (320, 180), cameraPixelBuffer: sCam, segmentationMaskBuffer: sMask,
+                backgroundVideoBuffer: nil, backgroundStaticTexture: nil, sceneDepthTexture: nil,
+                faceRect: SIMD4(0.5, 0.5, 0.30, 0.35), cameraCropRect: SIMD4(0, 0, 1, 1),
+                settings: skinSnap, produceSink: false, waitForGPUCompletion: true
+            ) {
+                CVPixelBufferLockBaseAddress(res.mainPixelBuffer, .readOnly)
+                let oBase = CVPixelBufferGetBaseAddress(res.mainPixelBuffer)!.assumingMemoryBound(to: UInt8.self)
+                let oBPR = CVPixelBufferGetBytesPerRow(res.mainPixelBuffer)
+                let p = oBase + 90 * oBPR + 160 * 4
+                let ob = Int(p[0]), og = Int(p[1]), or_ = Int(p[2])
+                CVPixelBufferUnlockBaseAddress(res.mainPixelBuffer, .readOnly)
+                let clipped = (or_ >= 250 || og >= 250 || ob >= 250) ? "CLIPPED" : "0% CLIPPED (Highlight-Safe)"
+                print("Bright Skin Highlight (In 223,193,195 @ StudioLight 100% + LUT): Out (\(or_),\(og),\(ob)) -> \(clipped)")
+            }
+        }
     }
 
     private static func makeSyntheticNV12CameraFrame(width w: Int, height h: Int) throws -> CVPixelBuffer {

@@ -463,6 +463,7 @@ public final class MetalStudioCompositor {
         let useLUT = settings.lutEnabled && (currentLUT != nil)
         let lutTex = currentLUT?.texture ?? dummy3DLUTTex
         let depthTex = sceneDepthTexture ?? fallbackDepthTex
+        let camGammaPower = Self.detectCameraDisplayGammaMatch(cameraPixelBuffer, isYUV: camIsYUV)
 
         var cu = CompositeUniformsGPU(
             outputSize: SIMD2(UInt32(outW), UInt32(outH)),
@@ -500,7 +501,7 @@ public final class MetalStudioCompositor {
             camCropRect: cameraCropRect,
             lutDomainMin: currentLUT?.domainMin ?? SIMD4<Float>(0, 0, 0, 0),
             lutDomainMax: currentLUT?.domainMax ?? SIMD4<Float>(1, 1, 1, 1),
-            matteTuning: SIMD4<Float>(settings.matteChoke, settings.temporalStability, 0, 0)
+            matteTuning: SIMD4<Float>(settings.matteChoke, settings.temporalStability, camGammaPower, 0)
         )
 
         if let enc = cmd.makeComputeCommandEncoder() {
@@ -638,6 +639,29 @@ public final class MetalStudioCompositor {
         }
     }
 
+    private static func detectCameraDisplayGammaMatch(_ pb: CVPixelBuffer, isYUV: Bool) -> Float {
+        guard isYUV else { return 1.0 }
+        // macOS AVFoundation UVC/built-in cameras tag 420v frames with SMPTE_240M_1995 or ITU_R_709_2
+        // (~1.96 Apple QuickTime camera gamma). Native macOS display ColorSync converts 1.96 -> 2.2 sRGB
+        // (pow(x, 1.12)). Applying the exact same transform keeps virtual-cam exposure & skin richness identical.
+        if let tf = CVBufferCopyAttachment(pb, kCVImageBufferTransferFunctionKey, nil) {
+            let s = "\(tf)"
+            if s.contains("sRGB") || s.contains("IEC_sRGB") {
+                return 1.0
+            }
+            if s.contains("240M") || s.contains("709") {
+                return 1.12
+            }
+        }
+        return 1.12
+    }
+
+    private static func attachSRGBColorTags(_ pb: CVPixelBuffer) {
+        CVBufferSetAttachment(pb, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_709_2, .shouldPropagate)
+        CVBufferSetAttachment(pb, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_sRGB, .shouldPropagate)
+        CVBufferSetAttachment(pb, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_709_2, .shouldPropagate)
+    }
+
     private func allocateFromMainPool(width: Int, height: Int) -> CVPixelBuffer? {
         if mainPoolSize != (width, height) || mainOutputPool == nil {
             mainOutputPool = Self.createIOSurfacePool(width: width, height: height)
@@ -646,6 +670,7 @@ public final class MetalStudioCompositor {
         guard let pool = mainOutputPool else { return nil }
         var pb: CVPixelBuffer?
         CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &pb)
+        if let validPB = pb { Self.attachSRGBColorTags(validPB) }
         return pb
     }
 
@@ -657,6 +682,7 @@ public final class MetalStudioCompositor {
         guard let pool = sinkOutputPool else { return nil }
         var pb: CVPixelBuffer?
         CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &pb)
+        if let validPB = pb { Self.attachSRGBColorTags(validPB) }
         return pb
     }
 
