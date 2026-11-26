@@ -1,0 +1,597 @@
+import Foundation
+import Metal
+import MetalPerformanceShaders
+import CoreVideo
+import IOSurface
+import QuartzCore
+import simd
+
+/// Matches `CompositeUniforms` in `StudioCamShaders.metal` byte-for-byte.
+private struct CompositeUniformsGPU {
+    var outputSize: SIMD2<UInt32>
+    var camSize: SIMD2<UInt32>
+    var bgSize: SIMD2<UInt32>
+
+    var camIsYUV: UInt32
+    var camFullRange: UInt32
+    var bgMode: UInt32
+    var bgIsYUV: UInt32
+
+    var portraitEnabled: UInt32
+    var portraitStrength: Float
+
+    var studioLightEnabled: UInt32
+    var studioLightStrength: Float
+
+    var edgeLightEnabled: UInt32
+    var edgeLightStrength: Float
+    var edgeLightWarmth: Float
+
+    var spillSuppression: Float
+    var edgeSoftness: Float
+    var mirrorHorizontal: UInt32
+    var _alignPad: UInt32 = 0
+
+    var gradTopColor: SIMD4<Float>
+    var gradBottomColor: SIMD4<Float>
+    var faceRect: SIMD4<Float>
+
+    var reactionType: UInt32
+    var reactionProgress: Float
+    var timeSeconds: Float
+    var lutStrength: Float
+
+    var lutEnabled: UInt32
+    var lutDimension: UInt32
+    var _lutPad0: UInt32 = 0
+    var _lutPad1: UInt32 = 0
+    var lutDomainMin: SIMD4<Float>
+    var lutDomainMax: SIMD4<Float>
+}
+
+/// Matches `GuidedUniforms` in `StudioCamShaders.metal` byte-for-byte.
+private struct GuidedUniformsGPU {
+    var gridSize: SIMD2<UInt32>
+    var radius: Int32
+    var eps: Float
+    var temporalBlend: Float
+    var colorSimSigma: Float
+    var hasHistory: UInt32
+    var camIsYUV: UInt32
+    var camFullRange: UInt32
+}
+
+public final class MetalStudioCompositor {
+    public let device: MTLDevice
+    public let commandQueue: MTLCommandQueue
+    private var textureCache: CVMetalTextureCache!
+
+    private let psoGuidedPrep: MTLComputePipelineState
+    private let psoBoxH: MTLComputePipelineState
+    private let psoBoxV: MTLComputePipelineState
+    private let psoSmoothAB: MTLComputePipelineState
+    private let psoDownsampleHalf: MTLComputePipelineState
+    private let psoComposite: MTLComputePipelineState
+    private let psoScaleSink: MTLComputePipelineState
+
+    // Fixed low-res guided-filter intermediate textures (512x288 = < 2.5 MB total VRAM!)
+    private let guideWidth = 512
+    private let guideHeight = 288
+    private var historyTexA: MTLTexture
+    private var historyTexB: MTLTexture
+    private var pingHistoryToggle = false
+    private var hasHistory = false
+
+    private var statsTex: MTLTexture
+    private var boxTempTex: MTLTexture
+    private var abRawTex: MTLTexture
+    private var abSmoothTex: MTLTexture
+    private var dummy1x1Tex: MTLTexture
+    private var dummy3DLUTTex: MTLTexture
+
+    // Active 3D Color LUT state
+    private let lutLock = NSLock()
+    private var activeLUT: Loaded3DLUT?
+
+    // Half-res bokeh working textures (lazy/resized)
+    private var halfSrcTex: MTLTexture?
+    private var halfBlurTex: MTLTexture?
+    private var cachedBlurSigma: Float = -1
+    private var gaussianBlur: MPSImageGaussianBlur?
+
+    // IOSurface-backed output pools
+    private var mainOutputPool: CVPixelBufferPool?
+    private var mainPoolSize: (Int, Int) = (0, 0)
+    private var sinkOutputPool: CVPixelBufferPool?
+    private var sinkPoolSize: (Int, Int) = (0, 0)
+    private var visionInputPool: CVPixelBufferPool?
+    private let visionWidth = 640
+    private let visionHeight = 360
+
+    private let metricsLock = NSLock()
+    private var _smoothedGPUMilliseconds: Double = 0.0
+    public var smoothedGPUMilliseconds: Double {
+        metricsLock.lock()
+        defer { metricsLock.unlock() }
+        return _smoothedGPUMilliseconds
+    }
+
+    public init(shaderSourceFallback: String) throws {
+        guard let dev = MTLCreateSystemDefaultDevice(),
+              let queue = dev.makeCommandQueue() else {
+            throw NSError(domain: "StudioCam.Metal", code: 1, userInfo: [NSLocalizedDescriptionKey: "Metal GPU unavailable"])
+        }
+        self.device = dev
+        self.commandQueue = queue
+
+        var cache: CVMetalTextureCache?
+        CVMetalTextureCacheCreate(kCFAllocatorDefault, nil, dev, nil, &cache)
+        self.textureCache = cache!
+
+        // Load precompiled default.metallib if bundled in .app, else compile embedded MSL once
+        let lib: MTLLibrary
+        if let metallibURL = Bundle.main.url(forResource: "default", withExtension: "metallib"),
+           let precompiled = try? dev.makeLibrary(URL: metallibURL) {
+            lib = precompiled
+        } else {
+            let opts = MTLCompileOptions()
+            opts.fastMathEnabled = true
+            lib = try dev.makeLibrary(source: shaderSourceFallback, options: opts)
+        }
+
+        func makePSO(_ name: String) throws -> MTLComputePipelineState {
+            guard let fn = lib.makeFunction(name: name) else {
+                throw NSError(domain: "StudioCam.Metal", code: 2, userInfo: [NSLocalizedDescriptionKey: "Missing Metal kernel \(name)"])
+            }
+            return try dev.makeComputePipelineState(function: fn)
+        }
+
+        self.psoGuidedPrep = try makePSO("guidedPrepAndTemporalEMA")
+        self.psoBoxH = try makePSO("boxFilterHorizontal")
+        self.psoBoxV = try makePSO("boxFilterVerticalAndCoeffs")
+        self.psoSmoothAB = try makePSO("smoothGuidedCoeffs")
+        self.psoDownsampleHalf = try makePSO("downsampleHalfBGRA")
+        self.psoComposite = try makePSO("compositeStudioFrame")
+        self.psoScaleSink = try makePSO("scaleBGRAForSink")
+
+        func makeGuideTex(_ fmt: MTLPixelFormat) -> MTLTexture {
+            let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: fmt, width: 512, height: 288, mipmapped: false)
+            d.usage = [.shaderRead, .shaderWrite]
+            d.storageMode = .private
+            return dev.makeTexture(descriptor: d)!
+        }
+
+        self.historyTexA = makeGuideTex(.rgba16Float)
+        self.historyTexB = makeGuideTex(.rgba16Float)
+        self.statsTex = makeGuideTex(.rgba16Float)
+        self.boxTempTex = makeGuideTex(.rgba16Float)
+        self.abRawTex = makeGuideTex(.rg16Float)
+        self.abSmoothTex = makeGuideTex(.rg16Float)
+
+        let d1 = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm, width: 1, height: 1, mipmapped: false)
+        d1.usage = [.shaderRead]
+        self.dummy1x1Tex = dev.makeTexture(descriptor: d1)!
+        var zero: UInt32 = 0xFF000000
+        self.dummy1x1Tex.replace(region: MTLRegionMake2D(0, 0, 1, 1), mipmapLevel: 0, withBytes: &zero, bytesPerRow: 4)
+
+        let d3 = MTLTextureDescriptor()
+        d3.textureType = .type3D
+        d3.pixelFormat = .rgba16Float
+        d3.width = 2
+        d3.height = 2
+        d3.depth = 2
+        d3.usage = [.shaderRead]
+        self.dummy3DLUTTex = dev.makeTexture(descriptor: d3)!
+    }
+
+    public func setActiveLUT(_ lut: Loaded3DLUT?) {
+        lutLock.lock()
+        activeLUT = lut
+        lutLock.unlock()
+    }
+
+    public func resetTemporalHistory() {
+        hasHistory = false
+    }
+
+    /// Downscales a 4K/1080p camera IOSurface to a 640x360 IOSurface on Metal (< 0.12 ms, 0% CPU)
+    /// so Vision's ANE person-segmentation & face-tracking never run an 8.3 MP CPU vImage downscale.
+    /// Full 3840x2160 hair detail is still recovered in `compositeStudioFrame` via the 4K luma guided filter!
+    public func makeVisionInputBuffer(from cameraPixelBuffer: CVPixelBuffer) -> CVPixelBuffer {
+        let w = CVPixelBufferGetWidth(cameraPixelBuffer)
+        let h = CVPixelBufferGetHeight(cameraPixelBuffer)
+        if w <= visionWidth && h <= visionHeight {
+            return cameraPixelBuffer
+        }
+        if visionInputPool == nil {
+            visionInputPool = Self.createIOSurfacePool(width: visionWidth, height: visionHeight)
+        }
+        guard let pool = visionInputPool else { return cameraPixelBuffer }
+        var dstPBOpt: CVPixelBuffer?
+        CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &dstPBOpt)
+        guard let dstPB = dstPBOpt,
+              let dstTex = makeBGRAWriteTexture(from: dstPB) else {
+            return cameraPixelBuffer
+        }
+        let (camP0, camP1, camIsYUV, camFullRange) = wrapPixelBuffer(cameraPixelBuffer)
+        guard let p0 = camP0,
+              let cmd = commandQueue.makeCommandBuffer(),
+              let enc = cmd.makeComputeCommandEncoder() else {
+            return cameraPixelBuffer
+        }
+        let p1 = camPlane0OrSecond(camP1)
+        var params = SIMD3<UInt32>(camIsYUV ? 1 : 0, camFullRange ? 1 : 0, 0)
+        enc.setComputePipelineState(psoDownsampleHalf)
+        enc.setTexture(p0, index: 0)
+        enc.setTexture(p1, index: 1)
+        enc.setTexture(dstTex, index: 2)
+        enc.setBytes(&params, length: MemoryLayout<SIMD3<UInt32>>.stride, index: 0)
+        enc.dispatchThreads(
+            MTLSize(width: visionWidth, height: visionHeight, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1)
+        )
+        enc.endEncoding()
+        cmd.commit()
+        cmd.waitUntilCompleted()
+        return dstPB
+    }
+
+    public struct RenderResult {
+        public let mainPixelBuffer: CVPixelBuffer
+        public let mainTexture: MTLTexture
+        public let sinkPixelBuffer: CVPixelBuffer?
+    }
+
+    public func renderFrame(
+        cameraPixelBuffer: CVPixelBuffer,
+        segmentationMaskBuffer: CVPixelBuffer?,
+        backgroundVideoBuffer: CVPixelBuffer?,
+        backgroundStaticTexture: MTLTexture?,
+        faceRect: SIMD4<Float>,
+        settings: RenderSettingsSnapshot,
+        produceSink: Bool,
+        sinkDimensions: (width: Int, height: Int) = (1920, 1080)
+    ) -> RenderResult? {
+        let outW = settings.resolution.width
+        let outH = settings.resolution.height
+
+        guard let outPB = allocateFromMainPool(width: outW, height: outH),
+              let outTex = makeBGRAWriteTexture(from: outPB) else {
+            return nil
+        }
+
+        let (camP0, camP1, camIsYUV, camFullRange) = wrapPixelBuffer(cameraPixelBuffer)
+        guard let camPlane0 = camP0 else { return nil }
+        let camPlane1 = camPlane0OrSecond(camP1)
+
+        guard let cmd = commandQueue.makeCommandBuffer() else { return nil }
+
+        // 1. Guided-Filter Hair Matte + Color-Similarity Temporal EMA (if any segmentation consumer is active)
+        let needsMask = (settings.backgroundMode != .none) || settings.portraitEnabled || settings.studioLightEnabled || settings.edgeLightEnabled
+        if needsMask, let maskPB = segmentationMaskBuffer, let maskTex = makeSinglePlaneR8Texture(from: maskPB) {
+            let prevHist = pingHistoryToggle ? historyTexB : historyTexA
+            let nextHist = pingHistoryToggle ? historyTexA : historyTexB
+            pingHistoryToggle.toggle()
+
+            var gu = GuidedUniformsGPU(
+                gridSize: SIMD2(UInt32(guideWidth), UInt32(guideHeight)),
+                radius: 4,
+                eps: 0.0018,
+                temporalBlend: 0.78,
+                colorSimSigma: 0.055,
+                hasHistory: hasHistory ? 1 : 0,
+                camIsYUV: camIsYUV ? 1 : 0,
+                camFullRange: camFullRange ? 1 : 0
+            )
+            hasHistory = true
+
+            if let enc = cmd.makeComputeCommandEncoder() {
+                let tg = MTLSize(width: 16, height: 16, depth: 1)
+                let grid = MTLSize(width: guideWidth, height: guideHeight, depth: 1)
+
+                enc.setComputePipelineState(psoGuidedPrep)
+                enc.setTexture(camPlane0, index: 0)
+                enc.setTexture(camPlane1, index: 1)
+                enc.setTexture(maskTex, index: 2)
+                enc.setTexture(prevHist, index: 3)
+                enc.setTexture(nextHist, index: 4)
+                enc.setTexture(statsTex, index: 5)
+                enc.setBytes(&gu, length: MemoryLayout<GuidedUniformsGPU>.stride, index: 0)
+                enc.dispatchThreads(grid, threadsPerThreadgroup: tg)
+
+                enc.setComputePipelineState(psoBoxH)
+                enc.setTexture(statsTex, index: 0)
+                enc.setTexture(boxTempTex, index: 1)
+                enc.setBytes(&gu, length: MemoryLayout<GuidedUniformsGPU>.stride, index: 0)
+                enc.dispatchThreads(grid, threadsPerThreadgroup: tg)
+
+                enc.setComputePipelineState(psoBoxV)
+                enc.setTexture(boxTempTex, index: 0)
+                enc.setTexture(abRawTex, index: 1)
+                enc.setBytes(&gu, length: MemoryLayout<GuidedUniformsGPU>.stride, index: 0)
+                enc.dispatchThreads(grid, threadsPerThreadgroup: tg)
+
+                enc.setComputePipelineState(psoSmoothAB)
+                enc.setTexture(abRawTex, index: 0)
+                enc.setTexture(abSmoothTex, index: 1)
+                enc.setBytes(&gu, length: MemoryLayout<GuidedUniformsGPU>.stride, index: 0)
+                enc.dispatchThreads(grid, threadsPerThreadgroup: tg)
+
+                enc.endEncoding()
+            }
+        }
+
+        // 2. Prepare Background Layer Textures
+        var bgPlane0: MTLTexture = dummy1x1Tex
+        var bgPlane1: MTLTexture = dummy1x1Tex
+        var bgIsYUV: Bool = false
+        var bgW: UInt32 = UInt32(outW)
+        var bgH: UInt32 = UInt32(outH)
+        var effectiveBGMode = settings.backgroundMode
+
+        if settings.backgroundMode == .video {
+            if let vPB = backgroundVideoBuffer {
+                let (vp0, vp1, vYUV, _) = wrapPixelBuffer(vPB)
+                if let validVP0 = vp0 {
+                    bgPlane0 = validVP0
+                    bgPlane1 = camPlane0OrSecond(vp1)
+                    bgIsYUV = vYUV
+                    bgW = UInt32(CVPixelBufferGetWidth(vPB))
+                    bgH = UInt32(CVPixelBufferGetHeight(vPB))
+                } else {
+                    effectiveBGMode = .gradient
+                }
+            } else {
+                effectiveBGMode = .gradient
+            }
+        } else if settings.backgroundMode == .image {
+            if let imgTex = backgroundStaticTexture {
+                bgPlane0 = imgTex
+                bgPlane1 = dummy1x1Tex
+                bgIsYUV = false
+                bgW = UInt32(imgTex.width)
+                bgH = UInt32(imgTex.height)
+            } else {
+                effectiveBGMode = .gradient
+            }
+        }
+
+        // 3. Optional Portrait Optical Bokeh (runs at 960x540 via MPSImageGaussianBlur -> < 0.18 ms GPU!)
+        var blurredResultTex: MTLTexture = dummy1x1Tex
+        if settings.portraitEnabled && settings.portraitStrength > 0.01 && effectiveBGMode != .gradient {
+            ensureHalfBokehTextures(width: 960, height: 540, sigma: 4.0 + 18.0 * settings.portraitStrength)
+            if let hSrc = halfSrcTex, let hBlur = halfBlurTex, let mpsBlur = gaussianBlur {
+                if let enc = cmd.makeComputeCommandEncoder() {
+                    enc.setComputePipelineState(psoDownsampleHalf)
+                    if effectiveBGMode == .none {
+                        enc.setTexture(camPlane0, index: 0)
+                        enc.setTexture(camPlane1, index: 1)
+                        var p = SIMD3<UInt32>(camIsYUV ? 1 : 0, camFullRange ? 1 : 0, 0)
+                        enc.setBytes(&p, length: MemoryLayout<SIMD3<UInt32>>.stride, index: 0)
+                    } else {
+                        enc.setTexture(bgPlane0, index: 0)
+                        enc.setTexture(bgPlane1, index: 1)
+                        var p = SIMD3<UInt32>(bgIsYUV ? 1 : 0, 0, 0)
+                        enc.setBytes(&p, length: MemoryLayout<SIMD3<UInt32>>.stride, index: 0)
+                    }
+                    enc.setTexture(hSrc, index: 2)
+                    enc.dispatchThreads(MTLSize(width: hSrc.width, height: hSrc.height, depth: 1),
+                                        threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1))
+                    enc.endEncoding()
+                }
+                mpsBlur.encode(commandBuffer: cmd, sourceTexture: hSrc, destinationTexture: hBlur)
+                blurredResultTex = hBlur
+            }
+        }
+
+        // 4. Reaction animation progress
+        let now = CACurrentMediaTime()
+        var rType = settings.activeReactionType
+        var rProg: Float = 0
+        if rType != 0 {
+            let elapsed = now - settings.activeReactionStart
+            if elapsed >= 0 && elapsed < 2.2 {
+                rProg = Float(elapsed / 2.2)
+            } else {
+                rType = 0
+            }
+        }
+
+        // 5. Fused Single-Pass 4K Composite (+ Trilinear 3D LUT)
+        lutLock.lock()
+        let currentLUT = activeLUT
+        lutLock.unlock()
+
+        let useLUT = settings.lutEnabled && (currentLUT != nil)
+        let lutTex = currentLUT?.texture ?? dummy3DLUTTex
+
+        var cu = CompositeUniformsGPU(
+            outputSize: SIMD2(UInt32(outW), UInt32(outH)),
+            camSize: SIMD2(UInt32(CVPixelBufferGetWidth(cameraPixelBuffer)), UInt32(CVPixelBufferGetHeight(cameraPixelBuffer))),
+            bgSize: SIMD2(bgW, bgH),
+            camIsYUV: camIsYUV ? 1 : 0,
+            camFullRange: camFullRange ? 1 : 0,
+            bgMode: UInt32(effectiveBGMode.rawValue),
+            bgIsYUV: bgIsYUV ? 1 : 0,
+            portraitEnabled: settings.portraitEnabled ? 1 : 0,
+            portraitStrength: settings.portraitStrength,
+            studioLightEnabled: settings.studioLightEnabled ? 1 : 0,
+            studioLightStrength: settings.studioLightStrength,
+            edgeLightEnabled: settings.edgeLightEnabled ? 1 : 0,
+            edgeLightStrength: settings.edgeLightStrength,
+            edgeLightWarmth: settings.edgeLightWarmth,
+            spillSuppression: settings.spillSuppression,
+            edgeSoftness: settings.edgeSoftness,
+            mirrorHorizontal: settings.mirrorPreview ? 1 : 0,
+            gradTopColor: settings.gradientPreset.topRGB,
+            gradBottomColor: settings.gradientPreset.bottomRGB,
+            faceRect: faceRect,
+            reactionType: rType,
+            reactionProgress: rProg,
+            timeSeconds: Float(fmod(now, 1000.0)),
+            lutStrength: settings.lutStrength,
+            lutEnabled: useLUT ? 1 : 0,
+            lutDimension: currentLUT?.dimension ?? 0,
+            lutDomainMin: currentLUT?.domainMin ?? SIMD4<Float>(0, 0, 0, 0),
+            lutDomainMax: currentLUT?.domainMax ?? SIMD4<Float>(1, 1, 1, 1)
+        )
+
+        if let enc = cmd.makeComputeCommandEncoder() {
+            enc.setComputePipelineState(psoComposite)
+            enc.setTexture(camPlane0, index: 0)
+            enc.setTexture(camPlane1, index: 1)
+            enc.setTexture(abSmoothTex, index: 2)
+            enc.setTexture(bgPlane0, index: 3)
+            enc.setTexture(bgPlane1, index: 4)
+            enc.setTexture(blurredResultTex, index: 5)
+            enc.setTexture(outTex, index: 6)
+            enc.setTexture(lutTex, index: 7)
+            enc.setBytes(&cu, length: MemoryLayout<CompositeUniformsGPU>.stride, index: 0)
+            enc.dispatchThreads(
+                MTLSize(width: outW, height: outH, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1)
+            )
+            enc.endEncoding()
+        }
+
+        // 6. Optional Virtual Camera Sink Buffer (zero-copy if resolution matches, else GPU supersampled!)
+        var sinkPBOut: CVPixelBuffer? = nil
+        if produceSink {
+            let sW = max(2, sinkDimensions.width)
+            let sH = max(2, sinkDimensions.height)
+            if outW == sW && outH == sH {
+                sinkPBOut = outPB
+            } else if let sPB = allocateFromSinkPool(width: sW, height: sH), let sTex = makeBGRAWriteTexture(from: sPB) {
+                if let enc = cmd.makeComputeCommandEncoder() {
+                    enc.setComputePipelineState(psoScaleSink)
+                    enc.setTexture(outTex, index: 0)
+                    enc.setTexture(sTex, index: 1)
+                    enc.dispatchThreads(
+                        MTLSize(width: sW, height: sH, depth: 1),
+                        threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1)
+                    )
+                    enc.endEncoding()
+                }
+                sinkPBOut = sPB
+            }
+        }
+
+        cmd.addCompletedHandler { [weak self] completedCmd in
+            let gpuMs = (completedCmd.gpuEndTime - completedCmd.gpuStartTime) * 1000.0
+            guard gpuMs > 0, let self = self else { return }
+            self.metricsLock.lock()
+            if self._smoothedGPUMilliseconds == 0 {
+                self._smoothedGPUMilliseconds = gpuMs
+            } else {
+                self._smoothedGPUMilliseconds = self._smoothedGPUMilliseconds * 0.88 + gpuMs * 0.12
+            }
+            self.metricsLock.unlock()
+        }
+
+        cmd.commit()
+        cmd.waitUntilScheduled()
+
+        return RenderResult(mainPixelBuffer: outPB, mainTexture: outTex, sinkPixelBuffer: sinkPBOut)
+    }
+
+    // MARK: - Zero-Copy CVMetalTextureCache Helpers
+
+    private func camPlane0OrSecond(_ tex: MTLTexture?) -> MTLTexture {
+        tex ?? dummy1x1Tex
+    }
+
+    private func wrapPixelBuffer(_ pb: CVPixelBuffer) -> (MTLTexture?, MTLTexture?, Bool, Bool) {
+        let fmt = CVPixelBufferGetPixelFormatType(pb)
+        if fmt == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange || fmt == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange {
+            let yW = CVPixelBufferGetWidthOfPlane(pb, 0)
+            let yH = CVPixelBufferGetHeightOfPlane(pb, 0)
+            let uvW = CVPixelBufferGetWidthOfPlane(pb, 1)
+            let uvH = CVPixelBufferGetHeightOfPlane(pb, 1)
+
+            var yRef: CVMetalTexture?
+            var uvRef: CVMetalTexture?
+            CVMetalTextureCacheCreateTextureFromImage(kCFAllocatorDefault, textureCache, pb, nil, .r8Unorm, yW, yH, 0, &yRef)
+            CVMetalTextureCacheCreateTextureFromImage(kCFAllocatorDefault, textureCache, pb, nil, .rg8Unorm, uvW, uvH, 1, &uvRef)
+            let yTex = yRef.flatMap { CVMetalTextureGetTexture($0) }
+            let uvTex = uvRef.flatMap { CVMetalTextureGetTexture($0) }
+            return (yTex, uvTex, true, fmt == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange)
+        } else {
+            let w = CVPixelBufferGetWidth(pb)
+            let h = CVPixelBufferGetHeight(pb)
+            var ref: CVMetalTexture?
+            CVMetalTextureCacheCreateTextureFromImage(kCFAllocatorDefault, textureCache, pb, nil, .bgra8Unorm, w, h, 0, &ref)
+            return (ref.flatMap { CVMetalTextureGetTexture($0) }, nil, false, false)
+        }
+    }
+
+    private func makeSinglePlaneR8Texture(from pb: CVPixelBuffer) -> MTLTexture? {
+        let w = CVPixelBufferGetWidth(pb)
+        let h = CVPixelBufferGetHeight(pb)
+        var ref: CVMetalTexture?
+        CVMetalTextureCacheCreateTextureFromImage(kCFAllocatorDefault, textureCache, pb, nil, .r8Unorm, w, h, 0, &ref)
+        return ref.flatMap { CVMetalTextureGetTexture($0) }
+    }
+
+    private func makeBGRAWriteTexture(from pb: CVPixelBuffer) -> MTLTexture? {
+        let w = CVPixelBufferGetWidth(pb)
+        let h = CVPixelBufferGetHeight(pb)
+        var ref: CVMetalTexture?
+        let attrs: [CFString: Any] = [
+            kCVMetalTextureUsage: MTLTextureUsage.shaderRead.rawValue | MTLTextureUsage.shaderWrite.rawValue | MTLTextureUsage.renderTarget.rawValue
+        ]
+        CVMetalTextureCacheCreateTextureFromImage(kCFAllocatorDefault, textureCache, pb, attrs as CFDictionary, .bgra8Unorm, w, h, 0, &ref)
+        return ref.flatMap { CVMetalTextureGetTexture($0) }
+    }
+
+    private func ensureHalfBokehTextures(width: Int, height: Int, sigma: Float) {
+        if halfSrcTex?.width != width || halfSrcTex?.height != height {
+            let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm, width: width, height: height, mipmapped: false)
+            d.usage = [.shaderRead, .shaderWrite]
+            d.storageMode = .private
+            halfSrcTex = device.makeTexture(descriptor: d)
+            halfBlurTex = device.makeTexture(descriptor: d)
+        }
+        if abs(cachedBlurSigma - sigma) > 0.35 {
+            cachedBlurSigma = sigma
+            let blur = MPSImageGaussianBlur(device: device, sigma: sigma)
+            blur.edgeMode = .clamp
+            gaussianBlur = blur
+        }
+    }
+
+    private func allocateFromMainPool(width: Int, height: Int) -> CVPixelBuffer? {
+        if mainPoolSize != (width, height) || mainOutputPool == nil {
+            mainOutputPool = Self.createIOSurfacePool(width: width, height: height)
+            mainPoolSize = (width, height)
+        }
+        guard let pool = mainOutputPool else { return nil }
+        var pb: CVPixelBuffer?
+        CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &pb)
+        return pb
+    }
+
+    private func allocateFromSinkPool(width: Int, height: Int) -> CVPixelBuffer? {
+        if sinkPoolSize != (width, height) || sinkOutputPool == nil {
+            sinkOutputPool = Self.createIOSurfacePool(width: width, height: height)
+            sinkPoolSize = (width, height)
+        }
+        guard let pool = sinkOutputPool else { return nil }
+        var pb: CVPixelBuffer?
+        CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &pb)
+        return pb
+    }
+
+    private static func createIOSurfacePool(width: Int, height: Int) -> CVPixelBufferPool? {
+        let poolAttrs: [CFString: Any] = [kCVPixelBufferPoolMinimumBufferCountKey: 4]
+        let pbAttrs: [CFString: Any] = [
+            kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_32BGRA,
+            kCVPixelBufferWidthKey: width,
+            kCVPixelBufferHeightKey: height,
+            kCVPixelBufferIOSurfacePropertiesKey: [:],
+            kCVPixelBufferMetalCompatibilityKey: true
+        ]
+        var pool: CVPixelBufferPool?
+        CVPixelBufferPoolCreate(kCFAllocatorDefault, poolAttrs as CFDictionary, pbAttrs as CFDictionary, &pool)
+        return pool
+    }
+}

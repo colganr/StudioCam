@@ -1,0 +1,18 @@
+# Swift Package Manager & Build Output
+.build/
+build/
+.swiftpm/
+Package.resolved
+
+# Generated local sample assets (auto-generated at runtime in ~/Library/Application Support/StudioCam)
+SampleBackgrounds/
+SampleLUTs/
+
+# Local research notes & binary dumps (keep repo 100% clean-room source)
+docs/
+
+# macOS / Editor
+.DS_Store
+*.xcodeproj
+*.xcworkspace
+xcuserdata/
