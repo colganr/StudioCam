@@ -252,10 +252,12 @@ enum HeadlessStudioBenchmark {
                     screenRingLightEnabled: false,
                     edgeLightStrength: 0.55,
                     edgeLightWarmth: 0.35,
-                    spillSuppression: 0.70,
-                    edgeSoftness: 0.45,
-                    lightWrapStrength: 0.45,
-                    ambientMatchStrength: 0.35,
+                    spillSuppression: 0.45,
+                    edgeSoftness: 0.62,
+                    matteChoke: 0.05,
+                    temporalStability: 0.80,
+                    lightWrapStrength: 0.18,
+                    ambientMatchStrength: 0.25,
                     autoFramingEnabled: false,
                     autoFramingZoom: 1.20,
                     skinPolishStrength: 0.25,
@@ -356,12 +358,227 @@ enum HeadlessStudioBenchmark {
             try benchmarkPipeline(label: "2. Auto (Teams/Meet 1080p) + Video Room BG", preset: .autoClient, bgMode: .video)
             try benchmarkPipeline(label: "3. Explicit 4K UHD Creator + Video Room BG", preset: .uhd4K, bgMode: .video)
 
+            print("\n--- Real-World Matte Shimmer & Motion-Release Stress Test (Noisy Webcam + ±0.30 Stateless Mask Flicker) ---")
+            try runTemporalShimmerStressTest(compositor: compositor)
+
             sinkBridge.stop()
             return 0
         } catch {
             print("Benchmark failed: \(error)")
             return 1
         }
+    }
+
+    private static func runTemporalShimmerStressTest(compositor: MetalStudioCompositor) throws {
+        let w = 1280, h = 720
+        let maskW = 512, maskH = 288
+        compositor.resetTemporalHistory()
+
+        let snap = RenderSettingsSnapshot(
+            resolution: .fhd1080,
+            segmentationQuality: .balancedANE,
+            backgroundMode: .gradient,
+            gradientPreset: StudioGradientPreset(
+                id: "test_black", name: "Black",
+                topRGB: SIMD4(0.0, 0.0, 0.0, 1.0),
+                bottomRGB: SIMD4(0.0, 0.0, 0.0, 1.0)
+            ),
+            portraitEnabled: false,
+            portraitStrength: 0.0,
+            depthBokehEnabled: false,
+            focalPlaneOffset: 0.16,
+            studioLightEnabled: false,
+            studioLightStrength: 0.0,
+            edgeLightEnabled: false,
+            screenRingLightEnabled: false,
+            edgeLightStrength: 0.0,
+            edgeLightWarmth: 0.0,
+            spillSuppression: 0.0,
+            edgeSoftness: 0.62,
+            matteChoke: 0.05,
+            temporalStability: 0.80,
+            lightWrapStrength: 0.0,
+            ambientMatchStrength: 0.0,
+            autoFramingEnabled: false,
+            autoFramingZoom: 1.0,
+            skinPolishStrength: 0.0,
+            filmGrainStrength: 0.0,
+            mirrorPreview: false,
+            reactionsGestureEnabled: false,
+            virtualCamEnabled: false,
+            lutEnabled: false,
+            lutStrength: 0.0,
+            activeReactionType: 0,
+            activeReactionStart: 0
+        )
+
+        func makeNoisyCam(frame: Int, shiftedRight: Bool) throws -> CVPixelBuffer {
+            let attrs: [CFString: Any] = [kCVPixelBufferIOSurfacePropertiesKey: [:], kCVPixelBufferMetalCompatibilityKey: true]
+            var pbOpt: CVPixelBuffer?
+            CVPixelBufferCreate(kCFAllocatorDefault, w, h, kCVPixelFormatType_32BGRA, attrs as CFDictionary, &pbOpt)
+            let pb = pbOpt!
+            CVPixelBufferLockBaseAddress(pb, [])
+            defer { CVPixelBufferUnlockBaseAddress(pb, []) }
+            let base = CVPixelBufferGetBaseAddress(pb)!.assumingMemoryBound(to: UInt8.self)
+            let bpr = CVPixelBufferGetBytesPerRow(pb)
+            let splitX = shiftedRight ? Int(Double(w) * 0.65) : Int(Double(w) * 0.50)
+            var rng: UInt32 = UInt32(truncatingIfNeeded: frame) &* 2654435761 &+ 1337
+            for y in 0..<h {
+                let row = base + y * bpr
+                for x in 0..<w {
+                    rng = rng &* 1664525 &+ 1013904223
+                    let isoNoise = Int((rng >> 24) % 9) - 4 // ±1.6% webcam ISO sensor grain
+                    let isPerson = x < splitX
+                    let r = max(0, min(255, (isPerson ? 215 : 42) + isoNoise))
+                    let g = max(0, min(255, (isPerson ? 195 : 48) + isoNoise))
+                    let b = max(0, min(255, (isPerson ? 185 : 58) + isoNoise))
+                    row[x * 4 + 0] = UInt8(b)
+                    row[x * 4 + 1] = UInt8(g)
+                    row[x * 4 + 2] = UInt8(r)
+                    row[x * 4 + 3] = 255
+                }
+            }
+            return pb
+        }
+
+        func makeFlickeringMask(frame: Int, shiftedRight: Bool) throws -> CVPixelBuffer {
+            let attrs: [CFString: Any] = [kCVPixelBufferIOSurfacePropertiesKey: [:], kCVPixelBufferMetalCompatibilityKey: true]
+            var pbOpt: CVPixelBuffer?
+            CVPixelBufferCreate(kCFAllocatorDefault, maskW, maskH, kCVPixelFormatType_OneComponent8, attrs as CFDictionary, &pbOpt)
+            let pb = pbOpt!
+            CVPixelBufferLockBaseAddress(pb, [])
+            defer { CVPixelBufferUnlockBaseAddress(pb, []) }
+            let base = CVPixelBufferGetBaseAddress(pb)!.assumingMemoryBound(to: UInt8.self)
+            let bpr = CVPixelBufferGetBytesPerRow(pb)
+            let splitX = shiftedRight ? Double(maskW) * 0.65 : Double(maskW) * 0.50
+            // Alternating ±4px (~±0.30 alpha) raw Vision boundary jitter every frame!
+            let jitter = (frame % 2 == 0) ? 3.5 : -3.5
+            for y in 0..<maskH {
+                let row = base + y * bpr
+                for x in 0..<maskW {
+                    let dist = (splitX + jitter) - Double(x)
+                    let v = max(0.0, min(1.0, 0.5 + dist / 10.0))
+                    row[x] = UInt8(v * 255.0)
+                }
+            }
+            return pb
+        }
+
+        func sampleEdgeBandLuma(_ pb: CVPixelBuffer, xMin: Int, xMax: Int) -> [Double] {
+            CVPixelBufferLockBaseAddress(pb, .readOnly)
+            defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
+            let base = CVPixelBufferGetBaseAddress(pb)!.assumingMemoryBound(to: UInt8.self)
+            let bpr = CVPixelBufferGetBytesPerRow(pb)
+            var vals: [Double] = []
+            vals.reserveCapacity((xMax - xMin) * 40)
+            for y in stride(from: 200, to: 520, by: 8) {
+                let row = base + y * bpr
+                for x in xMin..<xMax {
+                    let b = Double(row[x * 4 + 0]) / 255.0
+                    let g = Double(row[x * 4 + 1]) / 255.0
+                    let r = Double(row[x * 4 + 2]) / 255.0
+                    vals.append(0.2126 * r + 0.7152 * g + 0.0722 * b)
+                }
+            }
+            return vals
+        }
+
+        // 1a. Measure EXACT unstabilized raw Vision flicker RMS (hasHistory reset every frame)
+        var rawPrevEdge: [Double]? = nil
+        var rawSqSum = 0.0
+        var rawSqCount = 0
+        for f in 0..<12 {
+            compositor.resetTemporalHistory()
+            let camPB = try makeNoisyCam(frame: f, shiftedRight: false)
+            let maskPB = try makeFlickeringMask(frame: f, shiftedRight: false)
+            if let res = compositor.renderFrame(
+                outputDimensions: (w, h),
+                cameraPixelBuffer: camPB,
+                segmentationMaskBuffer: maskPB,
+                backgroundVideoBuffer: nil,
+                backgroundStaticTexture: nil,
+                sceneDepthTexture: nil,
+                faceRect: SIMD4(0.35, 0.42, 0.16, 0.24),
+                cameraCropRect: SIMD4(0, 0, 1, 1),
+                settings: snap,
+                produceSink: false,
+                waitForGPUCompletion: true
+            ) {
+                let edge = sampleEdgeBandLuma(res.mainPixelBuffer, xMin: w/2 - 14, xMax: w/2 + 14)
+                if let prev = rawPrevEdge {
+                    for i in 0..<edge.count {
+                        let d = edge[i] - prev[i]
+                        rawSqSum += d * d
+                        rawSqCount += 1
+                    }
+                }
+                rawPrevEdge = edge
+            }
+        }
+        let rawBaselineRMS = sqrt(rawSqSum / Double(max(1, rawSqCount)))
+
+        // 1b. Measure stabilized StudioCam matte RMS across 24 frames with temporal EMA + guided clamping active
+        compositor.resetTemporalHistory()
+        var prevEdge: [Double]? = nil
+        var sqDiffSum = 0.0
+        var sqDiffCount = 0
+        for f in 0..<24 {
+            let camPB = try makeNoisyCam(frame: f, shiftedRight: false)
+            let maskPB = try makeFlickeringMask(frame: f, shiftedRight: false)
+            if let res = compositor.renderFrame(
+                outputDimensions: (w, h),
+                cameraPixelBuffer: camPB,
+                segmentationMaskBuffer: maskPB,
+                backgroundVideoBuffer: nil,
+                backgroundStaticTexture: nil,
+                sceneDepthTexture: nil,
+                faceRect: SIMD4(0.35, 0.42, 0.16, 0.24),
+                cameraCropRect: SIMD4(0, 0, 1, 1),
+                settings: snap,
+                produceSink: false,
+                waitForGPUCompletion: true
+            ) {
+                let edge = sampleEdgeBandLuma(res.mainPixelBuffer, xMin: w/2 - 14, xMax: w/2 + 14)
+                if f >= 8, let prev = prevEdge {
+                    for i in 0..<edge.count {
+                        let d = edge[i] - prev[i]
+                        sqDiffSum += d * d
+                        sqDiffCount += 1
+                    }
+                }
+                prevEdge = edge
+            }
+        }
+        let stabilizedRMS = sqrt(sqDiffSum / Double(max(1, sqDiffCount)))
+        let suppressionFactor = rawBaselineRMS / max(1e-5, stabilizedRMS)
+
+        // 2. Verify instant motion release (hand/head moves right from x=50% to x=65% on a single frame!)
+        let moveCam = try makeNoisyCam(frame: 25, shiftedRight: true)
+        let moveMask = try makeFlickeringMask(frame: 25, shiftedRight: true)
+        var motionCaptureRatio = 0.0
+        if let res = compositor.renderFrame(
+            outputDimensions: (w, h),
+            cameraPixelBuffer: moveCam,
+            segmentationMaskBuffer: moveMask,
+            backgroundVideoBuffer: nil,
+            backgroundStaticTexture: nil,
+            sceneDepthTexture: nil,
+            faceRect: SIMD4(0.55, 0.42, 0.16, 0.24),
+            cameraCropRect: SIMD4(0, 0, 1, 1),
+            settings: snap,
+            produceSink: false,
+            waitForGPUCompletion: true
+        ) {
+            // Check newly uncovered person zone between x=54% and x=61% — should snap immediately to ~0.78 luma (zero ghost lag!)
+            let movedZone = sampleEdgeBandLuma(res.mainPixelBuffer, xMin: Int(Double(w) * 0.54), xMax: Int(Double(w) * 0.61))
+            let meanLuma = movedZone.reduce(0.0, +) / Double(max(1, movedZone.count))
+            motionCaptureRatio = (meanLuma / 0.78) * 100.0
+        }
+
+        print(String(
+            format: "Raw Unstabilized RMS: %.4f -> Stabilized RMS: %.4f (%.1f× shimmer reduction) | 1-Frame Motion Snap: %.1f%%",
+            rawBaselineRMS, stabilizedRMS, suppressionFactor, motionCaptureRatio
+        ))
     }
 
     private static func makeSyntheticNV12CameraFrame(width w: Int, height h: Int) throws -> CVPixelBuffer {

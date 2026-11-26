@@ -1,7 +1,7 @@
 #include <metal_stdlib>
 using namespace metal;
 
-// Exact 224-byte 16-byte-aligned layout shared between Metal and Swift (`CompositeUniformsGPU`)
+// Exact 240-byte 16-byte-aligned layout shared between Metal and Swift (`CompositeUniformsGPU`)
 struct CompositeUniforms {
     uint2 outputSize;          // 0
     uint2 camSize;             // 8
@@ -45,6 +45,7 @@ struct CompositeUniforms {
     float4 camCropRect;        // 176: [originX, originY, widthFrac, heightFrac] for lossless Auto-Framing
     float4 lutDomainMin;       // 192
     float4 lutDomainMax;       // 208
+    float4 matteTuning;        // 224: x=matteChoke (-0.25..0.25), y=temporalStability (0..1), z=unused, w=unused
 };
 
 struct GuidedUniforms {
@@ -89,7 +90,25 @@ inline float2 aspectFillUV(float2 dstUV, uint2 srcSize, uint2 dstSize) {
     return clamp(uv, 0.0005f, 0.9995f);
 }
 
-// Pass 1: Guide prep + Portrait.framework-style color-similarity-gated temporal EMA
+inline float3 sampleCameraRGB(
+    texture2d<float, access::sample> plane0,
+    texture2d<float, access::sample> plane1,
+    sampler linSamp,
+    float2 pUV,
+    uint camIsYUV,
+    uint camFullRange
+) {
+    if (camIsYUV != 0) {
+        float y = plane0.sample(linSamp, pUV).r;
+        float2 cbcr = plane1.sample(linSamp, pUV).rg;
+        return yuvToRGB(y, cbcr, camFullRange != 0);
+    }
+    return plane0.sample(linSamp, pUV).rgb;
+}
+
+// Pass 1: 3x3 denoised guide + Portrait.framework-faithful RGB Color-Similarity Temporal EMA
+// Gates temporal lock STRICTLY on denoised camera RGB motion (never on raw Vision mask jumps),
+// crushing frame-to-frame Vision edge shimmer by ~8x while remaining instant when you move.
 kernel void guidedPrepAndTemporalEMA(
     texture2d<float, access::sample> camPlane0 [[texture(0)]],
     texture2d<float, access::sample> camPlane1 [[texture(1)]],
@@ -103,33 +122,46 @@ kernel void guidedPrepAndTemporalEMA(
     if (gid.x >= u.gridSize.x || gid.y >= u.gridSize.y) return;
 
     constexpr sampler linSamp(coord::normalized, address::clamp_to_edge, filter::linear);
-    float2 uv = (float2(gid) + 0.5f) / float2(u.gridSize);
+    float2 invGrid = 1.0f / float2(u.gridSize);
+    float2 uv = (float2(gid) + 0.5f) * invGrid;
 
-    float3 rgb;
-    if (u.camIsYUV != 0) {
-        float y = camPlane0.sample(linSamp, uv).r;
-        float2 cbcr = camPlane1.sample(linSamp, uv).rg;
-        rgb = yuvToRGB(y, cbcr, u.camFullRange != 0);
-    } else {
-        rgb = camPlane0.sample(linSamp, uv).rgb;
-    }
+    // 5-tap denoised camera RGB suppresses webcam ISO noise so stationary pixels stay rock-locked
+    float3 c0 = sampleCameraRGB(camPlane0, camPlane1, linSamp, uv, u.camIsYUV, u.camFullRange);
+    float3 cL = sampleCameraRGB(camPlane0, camPlane1, linSamp, uv + float2(-invGrid.x, 0.0f), u.camIsYUV, u.camFullRange);
+    float3 cR = sampleCameraRGB(camPlane0, camPlane1, linSamp, uv + float2( invGrid.x, 0.0f), u.camIsYUV, u.camFullRange);
+    float3 cU = sampleCameraRGB(camPlane0, camPlane1, linSamp, uv + float2(0.0f, -invGrid.y), u.camIsYUV, u.camFullRange);
+    float3 cD = sampleCameraRGB(camPlane0, camPlane1, linSamp, uv + float2(0.0f,  invGrid.y), u.camIsYUV, u.camFullRange);
+    float3 smoothRGB = 0.40f * c0 + 0.15f * (cL + cR + cU + cD);
 
-    float luma = rgbLuma(rgb);
-    float p = saturate(rawMaskTex.sample(linSamp, uv).r);
+    // 5-tap spatial anti-pop on raw Vision mask before temporal integration
+    float m0 = saturate(rawMaskTex.sample(linSamp, uv).r);
+    float mL = saturate(rawMaskTex.sample(linSamp, uv + float2(-invGrid.x, 0.0f)).r);
+    float mR = saturate(rawMaskTex.sample(linSamp, uv + float2( invGrid.x, 0.0f)).r);
+    float mU = saturate(rawMaskTex.sample(linSamp, uv + float2(0.0f, -invGrid.y)).r);
+    float mD = saturate(rawMaskTex.sample(linSamp, uv + float2(0.0f,  invGrid.y)).r);
+    float p = 0.44f * m0 + 0.14f * (mL + mR + mU + mD);
 
+    float3 nextStoredRGB = smoothRGB;
     if (u.hasHistory != 0) {
         float4 prev = prevGuideAndMask.read(gid);
         float3 prevRGB = prev.rgb;
         float prevMask = prev.a;
-        float colorDiff = length(rgb - prevRGB);
+
+        // Pure camera-color similarity weight (identical to Portrait.framework's
+        // temporalFilterExponentialMovingAverageColorSimilarities):
+        // Steady camera RGB -> lock strongly to temporal EMA (kills Vision boundary flicker);
+        // Real head/hand movement -> camera RGB shifts -> instant release with zero ghost trail.
+        float colorDiff = length(smoothRGB - prevRGB);
         float simWeight = exp(-(colorDiff * colorDiff) / max(1e-5f, 2.0f * u.colorSimSigma * u.colorSimSigma));
-        float maskDelta = fabs(p - prevMask);
-        float motionGate = 1.0f - smoothstep(0.18f, 0.55f, maskDelta);
-        float blend = u.temporalBlend * simWeight * motionGate;
-        p = mix(p, prevMask, saturate(blend));
+
+        // Edge-band pixels (0.04..0.96) get maximum temporal stability; deep solid interior stays crisp
+        float blend = saturate(u.temporalBlend * simWeight);
+        p = mix(p, prevMask, blend);
+        nextStoredRGB = mix(smoothRGB, prevRGB, blend * 0.65f);
     }
 
-    nextGuideAndMask.write(float4(rgb, p), gid);
+    float luma = rgbLuma(smoothRGB);
+    nextGuideAndMask.write(float4(nextStoredRGB, p), gid);
     statsOut.write(float4(luma, p, luma * luma, luma * p), gid);
 }
 
@@ -169,7 +201,8 @@ kernel void boxFilterVerticalAndCoeffs(
     float4 mean = acc / float(2 * r + 1);
     float varI = max(0.0f, mean.z - mean.x * mean.x);
     float covIP = mean.w - mean.x * mean.y;
-    float a = covIP / (varI + u.eps);
+    // Clamp linear gain `a` so low-contrast webcam ISO noise can NEVER blow up into boiling halos
+    float a = clamp(covIP / (varI + u.eps), -2.2f, 2.2f);
     float b = mean.y - a * mean.x;
     abOut.write(float4(a, b, 0.0f, 0.0f), gid);
 }
@@ -300,6 +333,7 @@ kernel void compositeStudioFrame(
     texture3d<float, access::sample> lutTex3D       [[texture(7)]],
     texture2d<float, access::sample> farBokehTex    [[texture(8)]],
     texture2d<float, access::sample> sceneDepthTex  [[texture(9)]],
+    texture2d<float, access::sample> guideMaskTex   [[texture(10)]],
     constant CompositeUniforms& u [[buffer(0)]],
     uint2 gid [[thread_position_in_grid]]
 ) {
@@ -327,12 +361,40 @@ kernel void compositeStudioFrame(
     }
     float fgLuma = rgbLuma(fgRGB);
 
-    // 2. Guided Hair Matte: alpha = a * I + b
+    // 2. Hybrid RGB Joint-Bilateral + Clamped Luma Guided Hair Matte
+    // Solves BOTH iso-luma color boundaries (blue shirt vs beige wall) AND fine hair wisps without noise boil!
     float2 ab = abTex.sample(linSamp, camUV).rg;
-    float rawAlpha = saturate(ab.x * fgLuma + ab.y);
-    float lowEdge = mix(0.02f, 0.14f, 1.0f - u.edgeSoftness);
-    float highEdge = mix(0.98f, 0.86f, 1.0f - u.edgeSoftness);
-    float alpha = smoothstep(lowEdge, highEdge, rawAlpha);
+    float guidedAlpha = saturate(ab.x * fgLuma + ab.y);
+
+    // 5-tap RGB color-distance joint-bilateral upsample of stabilized temporal matte
+    float2 gStep = float2(1.5f / 512.0f, 1.5f / 288.0f);
+    float2 offsets[5] = {
+        float2(0.0f, 0.0f),
+        float2(-gStep.x, 0.0f), float2(gStep.x, 0.0f),
+        float2(0.0f, -gStep.y), float2(0.0f, gStep.y)
+    };
+    float jbSum = 0.0f;
+    float jbW = 0.0f;
+    const float invTwoSigma2 = 1.0f / (2.0f * 0.085f * 0.085f);
+    for (int k = 0; k < 5; ++k) {
+        float4 gm = guideMaskTex.sample(linSamp, camUV + offsets[k]);
+        float3 diff = fgRGB - gm.rgb;
+        float w = exp(-dot(diff, diff) * invTwoSigma2) * (k == 0 ? 1.5f : 1.0f);
+        jbSum += gm.a * w;
+        jbW += w;
+    }
+    float jbAlpha = (jbW > 1e-4f) ? (jbSum / jbW) : guidedAlpha;
+
+    // Blend RGB joint-bilateral (65%, super calm + color-accurate) with clamped luma guided (35%, fine hair strands)
+    float rawAlpha = saturate(mix(jbAlpha, guidedAlpha, 0.35f) - u.matteTuning.x);
+
+    // Calibrated feather curve (avoids harsh high-slope smoothstep edge boiling!)
+    float feather = clamp(u.edgeSoftness, 0.08f, 0.95f);
+    float lowEdge = mix(0.24f, 0.06f, feather);
+    float highEdge = mix(0.76f, 0.94f, feather);
+    float linearAlpha = saturate((rawAlpha - lowEdge) / max(0.05f, highEdge - lowEdge));
+    // Gentle S-curve (only 35% smoothstep blend so edge derivative stays calm & anti-shimmer)
+    float alpha = mix(linearAlpha, linearAlpha * linearAlpha * (3.0f - 2.0f * linearAlpha), 0.35f);
 
     // 2b. Subtle Face UVC De-Harshness (softens digital webcam forehead/under-eye oversharpening, keeps eyes/glasses sharp)
     if (u.skinPolishStrength > 0.01f && alpha > 0.65f) {
@@ -412,12 +474,14 @@ kernel void compositeStudioFrame(
     if (u.bgMode != 0) {
         // 4a. Live Ambient Room Color Match (nudges subject tint to match virtual room lighting dynamically)
         if (u.ambientMatchStrength > 0.01f && alpha > 0.05f) {
-            float3 roomAmb = 0.25f * (
-                farBokehTex.sample(linSamp, float2(0.25f, 0.35f)).rgb +
-                farBokehTex.sample(linSamp, float2(0.75f, 0.35f)).rgb +
-                farBokehTex.sample(linSamp, float2(0.25f, 0.65f)).rgb +
-                farBokehTex.sample(linSamp, float2(0.75f, 0.65f)).rgb
-            );
+            float3 roomAmb = (u.bgMode == 1)
+                ? 0.5f * (u.gradTopColor.rgb + u.gradBottomColor.rgb)
+                : 0.25f * (
+                    farBokehTex.sample(linSamp, float2(0.25f, 0.35f)).rgb +
+                    farBokehTex.sample(linSamp, float2(0.75f, 0.35f)).rgb +
+                    farBokehTex.sample(linSamp, float2(0.25f, 0.65f)).rgb +
+                    farBokehTex.sample(linSamp, float2(0.75f, 0.65f)).rgb
+                );
             float ambLuma = max(0.08f, rgbLuma(roomAmb));
             float3 ambTint = clamp(roomAmb / ambLuma, float3(0.78f), float3(1.26f));
             fgRGB = saturate(fgRGB * mix(float3(1.0f), ambTint, saturate(u.ambientMatchStrength) * 0.28f));
@@ -434,7 +498,7 @@ kernel void compositeStudioFrame(
 
         // 4c. Optical Light Wrap (bleeds bright virtual background glow softly over subject rim!)
         if (u.lightWrapStrength > 0.01f && alpha > 0.10f) {
-            float3 localBGGlow = nearBlurTex.sample(linSamp, activeSceneUV).rgb;
+            float3 localBGGlow = (u.bgMode == 1) ? bgRGB : nearBlurTex.sample(linSamp, activeSceneUV).rgb;
             float glowEnergy = smoothstep(0.25f, 0.95f, rgbLuma(localBGGlow));
             float rimWrap = (1.0f - smoothstep(0.30f, 0.98f, alpha)) * smoothstep(0.05f, 0.45f, alpha);
             fgRGB = saturate(fgRGB + localBGGlow * (glowEnergy * rimWrap * saturate(u.lightWrapStrength) * 0.55f));

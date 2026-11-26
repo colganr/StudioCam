@@ -652,6 +652,20 @@ public struct ControlCenterMenuView: View {
             }
 
             HStack {
+                Text("Edge Calm")
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.white.opacity(0.65))
+                    .frame(width: 62, alignment: .leading)
+                Slider(value: $settings.temporalStability, in: 0.0...1.0)
+                    .controlSize(.mini)
+                Text("Edge Trim")
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.white.opacity(0.65))
+                Slider(value: $settings.matteChoke, in: -0.10...0.22)
+                    .controlSize(.mini)
+            }
+
+            HStack {
                 Text("Hair Spill")
                     .font(.system(size: 10.5))
                     .foregroundStyle(.white.opacity(0.65))
@@ -661,7 +675,7 @@ public struct ControlCenterMenuView: View {
                 Text("Feather")
                     .font(.system(size: 10.5))
                     .foregroundStyle(.white.opacity(0.65))
-                Slider(value: $settings.edgeSoftness, in: 0.05...0.95)
+                Slider(value: $settings.edgeSoftness, in: 0.08...0.95)
                     .controlSize(.mini)
             }
 

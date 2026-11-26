@@ -102,8 +102,8 @@ public struct StudioProfilePreset: Identifiable, Codable, Equatable, Sendable {
             studioLightEnabled: true,
             studioLightStrength: 0.52,
             edgeLightEnabled: false,
-            lightWrapStrength: 0.45,
-            ambientMatchStrength: 0.35,
+            lightWrapStrength: 0.18,
+            ambientMatchStrength: 0.25,
             autoFramingEnabled: false,
             skinPolishStrength: 0.25,
             filmGrainStrength: 0.14,
@@ -142,8 +142,8 @@ public struct StudioProfilePreset: Identifiable, Codable, Equatable, Sendable {
             studioLightEnabled: true,
             studioLightStrength: 0.60,
             edgeLightEnabled: false,
-            lightWrapStrength: 0.55,
-            ambientMatchStrength: 0.45,
+            lightWrapStrength: 0.28,
+            ambientMatchStrength: 0.30,
             autoFramingEnabled: true,
             skinPolishStrength: 0.28,
             filmGrainStrength: 0.20,
@@ -187,6 +187,8 @@ public struct RenderSettingsSnapshot: Sendable {
     public var edgeLightWarmth: Float
     public var spillSuppression: Float
     public var edgeSoftness: Float
+    public var matteChoke: Float
+    public var temporalStability: Float
     public var lightWrapStrength: Float
     public var ambientMatchStrength: Float
     public var autoFramingEnabled: Bool
@@ -228,8 +230,9 @@ public final class StudioSettings: ObservableObject {
     @Published public var selectedCameraUniqueID: String = ""
     @Published public var activeProfileID: String = "executive_call"
     // Default to Auto (Match Client) so 1080p Teams/Meet calls run natively at 1080p with zero 4K downsample!
+    // Default to Balanced ANE (512x384) — never .fast — for calm, hair-accurate video call edges!
     @Published public var resolution: CaptureResolutionPreset = .autoClient { didSet { syncSnapshot() } }
-    @Published public var segmentationQuality: SegmentationQualityPreset = .fastVideoCall { didSet { syncSnapshot() } }
+    @Published public var segmentationQuality: SegmentationQualityPreset = .balancedANE { didSet { syncSnapshot() } }
 
     @Published public var portraitEnabled: Bool = true { didSet { syncSnapshot() } }
     @Published public var portraitStrength: Float = 0.62 { didSet { syncSnapshot() } }
@@ -249,10 +252,12 @@ public final class StudioSettings: ObservableObject {
     @Published public var customBackgroundURL: URL? = nil
     @Published public var recentBackgroundURLs: [URL] = []
 
-    @Published public var spillSuppression: Float = 0.70 { didSet { syncSnapshot() } }
-    @Published public var edgeSoftness: Float = 0.45 { didSet { syncSnapshot() } }
-    @Published public var lightWrapStrength: Float = 0.45 { didSet { syncSnapshot() } }
-    @Published public var ambientMatchStrength: Float = 0.35 { didSet { syncSnapshot() } }
+    @Published public var spillSuppression: Float = 0.45 { didSet { syncSnapshot() } }
+    @Published public var edgeSoftness: Float = 0.62 { didSet { syncSnapshot() } }
+    @Published public var matteChoke: Float = 0.05 { didSet { syncSnapshot() } }
+    @Published public var temporalStability: Float = 0.80 { didSet { syncSnapshot() } }
+    @Published public var lightWrapStrength: Float = 0.18 { didSet { syncSnapshot() } }
+    @Published public var ambientMatchStrength: Float = 0.25 { didSet { syncSnapshot() } }
 
     @Published public var autoFramingEnabled: Bool = false { didSet { syncSnapshot() } }
     @Published public var autoFramingZoom: Float = 1.22 { didSet { syncSnapshot() } }
@@ -278,7 +283,7 @@ public final class StudioSettings: ObservableObject {
         let grad = StudioGradientPreset.presets[0]
         self.storage = SnapshotStorage(RenderSettingsSnapshot(
             resolution: .autoClient,
-            segmentationQuality: .fastVideoCall,
+            segmentationQuality: .balancedANE,
             backgroundMode: .gradient,
             gradientPreset: grad,
             portraitEnabled: true,
@@ -291,10 +296,12 @@ public final class StudioSettings: ObservableObject {
             screenRingLightEnabled: true,
             edgeLightStrength: 0.60,
             edgeLightWarmth: 0.35,
-            spillSuppression: 0.70,
-            edgeSoftness: 0.45,
-            lightWrapStrength: 0.45,
-            ambientMatchStrength: 0.35,
+            spillSuppression: 0.45,
+            edgeSoftness: 0.62,
+            matteChoke: 0.05,
+            temporalStability: 0.80,
+            lightWrapStrength: 0.18,
+            ambientMatchStrength: 0.25,
             autoFramingEnabled: false,
             autoFramingZoom: 1.22,
             skinPolishStrength: 0.25,
@@ -391,6 +398,8 @@ public final class StudioSettings: ObservableObject {
             s.edgeLightWarmth = edgeLightWarmth
             s.spillSuppression = spillSuppression
             s.edgeSoftness = edgeSoftness
+            s.matteChoke = matteChoke
+            s.temporalStability = temporalStability
             s.lightWrapStrength = lightWrapStrength
             s.ambientMatchStrength = ambientMatchStrength
             s.autoFramingEnabled = autoFramingEnabled
@@ -409,7 +418,9 @@ public final class StudioSettings: ObservableObject {
     private func savePersisted() {
         let d = UserDefaults.standard
         d.set(resolution.rawValue, forKey: "sc.resolutionV2")
-        d.set(segmentationQuality.rawValue, forKey: "sc.segQualityV2")
+        d.set(segmentationQuality.rawValue, forKey: "sc.segQualityV3")
+        d.set(matteChoke, forKey: "sc.matteChoke")
+        d.set(temporalStability, forKey: "sc.temporalStability")
         d.set(portraitEnabled, forKey: "sc.portrait")
         d.set(portraitStrength, forKey: "sc.portraitStrength")
         d.set(depthBokehEnabled, forKey: "sc.depthBokeh")
@@ -424,8 +435,8 @@ public final class StudioSettings: ObservableObject {
         d.set(selectedGradientID, forKey: "sc.gradID")
         d.set(customBackgroundURL?.path, forKey: "sc.customBG")
         d.set(recentBackgroundURLs.map(\.path), forKey: "sc.recentBGs")
-        d.set(lightWrapStrength, forKey: "sc.lightWrap")
-        d.set(ambientMatchStrength, forKey: "sc.ambientMatch")
+        d.set(lightWrapStrength, forKey: "sc.lightWrapV2")
+        d.set(ambientMatchStrength, forKey: "sc.ambientMatchV2")
         d.set(autoFramingEnabled, forKey: "sc.autoFrame")
         d.set(autoFramingZoom, forKey: "sc.autoFrameZoom")
         d.set(skinPolishStrength, forKey: "sc.skinPolish")
@@ -434,14 +445,16 @@ public final class StudioSettings: ObservableObject {
         d.set(lutStrength, forKey: "sc.lutStrength")
         d.set(selectedLUTURL?.path, forKey: "sc.selectedLUT")
         d.set(recentLUTURLs.map(\.path), forKey: "sc.recentLUTs")
-        d.set(spillSuppression, forKey: "sc.spill")
-        d.set(edgeSoftness, forKey: "sc.softness")
+        d.set(spillSuppression, forKey: "sc.spillV2")
+        d.set(edgeSoftness, forKey: "sc.softnessV2")
     }
 
     private func loadPersisted() {
         let d = UserDefaults.standard
         if let r = d.string(forKey: "sc.resolutionV2"), let p = CaptureResolutionPreset(rawValue: r) { resolution = p }
-        if let q = d.string(forKey: "sc.segQualityV2"), let p = SegmentationQualityPreset(rawValue: q) { segmentationQuality = p }
+        if let q = d.string(forKey: "sc.segQualityV3"), let p = SegmentationQualityPreset(rawValue: q) { segmentationQuality = p }
+        if d.object(forKey: "sc.matteChoke") != nil { matteChoke = d.float(forKey: "sc.matteChoke") }
+        if d.object(forKey: "sc.temporalStability") != nil { temporalStability = d.float(forKey: "sc.temporalStability") }
         if d.object(forKey: "sc.portrait") != nil { portraitEnabled = d.bool(forKey: "sc.portrait") }
         if d.object(forKey: "sc.portraitStrength") != nil { portraitStrength = d.float(forKey: "sc.portraitStrength") }
         if d.object(forKey: "sc.depthBokeh") != nil { depthBokehEnabled = d.bool(forKey: "sc.depthBokeh") }
@@ -460,8 +473,8 @@ public final class StudioSettings: ObservableObject {
         if let arr = d.stringArray(forKey: "sc.recentBGs") {
             recentBackgroundURLs = arr.filter { FileManager.default.fileExists(atPath: $0) }.map { URL(fileURLWithPath: $0) }
         }
-        if d.object(forKey: "sc.lightWrap") != nil { lightWrapStrength = d.float(forKey: "sc.lightWrap") }
-        if d.object(forKey: "sc.ambientMatch") != nil { ambientMatchStrength = d.float(forKey: "sc.ambientMatch") }
+        if d.object(forKey: "sc.lightWrapV2") != nil { lightWrapStrength = d.float(forKey: "sc.lightWrapV2") }
+        if d.object(forKey: "sc.ambientMatchV2") != nil { ambientMatchStrength = d.float(forKey: "sc.ambientMatchV2") }
         if d.object(forKey: "sc.autoFrame") != nil { autoFramingEnabled = d.bool(forKey: "sc.autoFrame") }
         if d.object(forKey: "sc.autoFrameZoom") != nil { autoFramingZoom = d.float(forKey: "sc.autoFrameZoom") }
         if d.object(forKey: "sc.skinPolish") != nil { skinPolishStrength = d.float(forKey: "sc.skinPolish") }
@@ -474,8 +487,8 @@ public final class StudioSettings: ObservableObject {
         if let larr = d.stringArray(forKey: "sc.recentLUTs") {
             recentLUTURLs = larr.filter { FileManager.default.fileExists(atPath: $0) }.map { URL(fileURLWithPath: $0) }
         }
-        if d.object(forKey: "sc.spill") != nil { spillSuppression = d.float(forKey: "sc.spill") }
-        if d.object(forKey: "sc.softness") != nil { edgeSoftness = d.float(forKey: "sc.softness") }
+        if d.object(forKey: "sc.spillV2") != nil { spillSuppression = d.float(forKey: "sc.spillV2") }
+        if d.object(forKey: "sc.softnessV2") != nil { edgeSoftness = d.float(forKey: "sc.softnessV2") }
         if let cData = d.data(forKey: "sc.customProfile"),
            let cp = try? JSONDecoder().decode(StudioProfilePreset.self, from: cData) {
             customUserProfile = cp

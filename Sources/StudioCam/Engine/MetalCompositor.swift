@@ -6,7 +6,7 @@ import IOSurface
 import QuartzCore
 import simd
 
-/// Exact 224-byte 16-byte-aligned match to `CompositeUniforms` in `StudioCamShaders.metal`.
+/// Exact 240-byte 16-byte-aligned match to `CompositeUniforms` in `StudioCamShaders.metal`.
 private struct CompositeUniformsGPU {
     var outputSize: SIMD2<UInt32>          // 0
     var camSize: SIMD2<UInt32>             // 8
@@ -50,6 +50,7 @@ private struct CompositeUniformsGPU {
     var camCropRect: SIMD4<Float>          // 176
     var lutDomainMin: SIMD4<Float>         // 192
     var lutDomainMax: SIMD4<Float>         // 208
+    var matteTuning: SIMD4<Float>          // 224: x=matteChoke, y=temporalStability
 }
 
 private struct GuidedUniformsGPU {
@@ -108,8 +109,7 @@ public final class MetalStudioCompositor {
     private var sinkOutputPool: CVPixelBufferPool?
     private var sinkPoolSize: (Int, Int) = (0, 0)
     private var visionInputPool: CVPixelBufferPool?
-    private let visionWidth = 640
-    private let visionHeight = 360
+    private var visionPoolSize: (Int, Int) = (0, 0)
 
     private let metricsLock = NSLock()
     private var _smoothedGPUMilliseconds: Double = 0.0
@@ -216,14 +216,19 @@ public final class MetalStudioCompositor {
         hasHistory = false
     }
 
-    public func makeVisionInputBuffer(from cameraPixelBuffer: CVPixelBuffer) -> CVPixelBuffer {
+    public func makeVisionInputBuffer(from cameraPixelBuffer: CVPixelBuffer, quality: SegmentationQualityPreset = .balancedANE) -> CVPixelBuffer {
+        // Give Balanced/Accurate Vision a crisp 960x540 input (clean hair/shoulder anti-aliasing!)
+        // and only downscale to 640x360 when Ultra-Light (.fast) is explicitly selected.
+        let targetW = (quality == .fastVideoCall) ? 640 : 960
+        let targetH = (quality == .fastVideoCall) ? 360 : 540
         let w = CVPixelBufferGetWidth(cameraPixelBuffer)
         let h = CVPixelBufferGetHeight(cameraPixelBuffer)
-        if w <= visionWidth && h <= visionHeight {
+        if w <= targetW && h <= targetH {
             return cameraPixelBuffer
         }
-        if visionInputPool == nil {
-            visionInputPool = Self.createIOSurfacePool(width: visionWidth, height: visionHeight)
+        if visionInputPool == nil || visionPoolSize != (targetW, targetH) {
+            visionInputPool = Self.createIOSurfacePool(width: targetW, height: targetH)
+            visionPoolSize = (targetW, targetH)
         }
         guard let pool = visionInputPool else { return cameraPixelBuffer }
         var dstPBOpt: CVPixelBuffer?
@@ -246,7 +251,7 @@ public final class MetalStudioCompositor {
         enc.setTexture(dstTex, index: 2)
         enc.setBytes(&params, length: MemoryLayout<SIMD3<UInt32>>.stride, index: 0)
         enc.dispatchThreads(
-            MTLSize(width: visionWidth, height: visionHeight, depth: 1),
+            MTLSize(width: targetW, height: targetH, depth: 1),
             threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1)
         )
         enc.endEncoding()
@@ -289,19 +294,23 @@ public final class MetalStudioCompositor {
 
         guard let cmd = commandQueue.makeCommandBuffer() else { return nil }
 
-        // 1. Guided-Filter Hair Matte + Color-Similarity Temporal EMA
+        // 1. Noise-Safe Guided-Filter Hair Matte + Pure RGB Color-Similarity Temporal EMA
         let needsMask = (settings.backgroundMode != .none) || settings.portraitEnabled || settings.studioLightEnabled || settings.edgeLightEnabled
+        var currentGuideMaskTex: MTLTexture = pingHistoryToggle ? historyTexB : historyTexA
         if needsMask, let maskPB = segmentationMaskBuffer, let maskTex = makeSinglePlaneR8Texture(from: maskPB) {
             let prevHist = pingHistoryToggle ? historyTexB : historyTexA
             let nextHist = pingHistoryToggle ? historyTexA : historyTexB
+            currentGuideMaskTex = nextHist
             pingHistoryToggle.toggle()
 
+            // Noise-safe eps=0.016 + radius=3 + strong stationary temporal lock (0.70..0.94)
+            let tempBlend = Float(0.70 + 0.24 * max(0.0, min(1.0, settings.temporalStability)))
             var gu = GuidedUniformsGPU(
                 gridSize: SIMD2(UInt32(guideWidth), UInt32(guideHeight)),
-                radius: 4,
-                eps: 0.0018,
-                temporalBlend: 0.78,
-                colorSimSigma: 0.055,
+                radius: 3,
+                eps: 0.016,
+                temporalBlend: tempBlend,
+                colorSimSigma: 0.052,
                 hasHistory: hasHistory ? 1 : 0,
                 camIsYUV: camIsYUV ? 1 : 0,
                 camFullRange: camFullRange ? 1 : 0
@@ -490,7 +499,8 @@ public final class MetalStudioCompositor {
             faceRect: faceRect,
             camCropRect: cameraCropRect,
             lutDomainMin: currentLUT?.domainMin ?? SIMD4<Float>(0, 0, 0, 0),
-            lutDomainMax: currentLUT?.domainMax ?? SIMD4<Float>(1, 1, 1, 1)
+            lutDomainMax: currentLUT?.domainMax ?? SIMD4<Float>(1, 1, 1, 1),
+            matteTuning: SIMD4<Float>(settings.matteChoke, settings.temporalStability, 0, 0)
         )
 
         if let enc = cmd.makeComputeCommandEncoder() {
@@ -505,6 +515,7 @@ public final class MetalStudioCompositor {
             enc.setTexture(lutTex, index: 7)
             enc.setTexture(farOutTex, index: 8)
             enc.setTexture(depthTex, index: 9)
+            enc.setTexture(currentGuideMaskTex, index: 10)
             enc.setBytes(&cu, length: MemoryLayout<CompositeUniformsGPU>.stride, index: 0)
             enc.dispatchThreads(
                 MTLSize(width: outW, height: outH, depth: 1),

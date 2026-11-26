@@ -611,7 +611,7 @@ extension StudioPipeline: AVCaptureVideoDataOutputSampleBufferDelegate {
         // 1. ANE Person Segmentation + Face Tracking (for Studio Light, Skin Polish, and Auto-Framing)
         let needsSegmentation = (snap.backgroundMode != .none) || snap.portraitEnabled || snap.studioLightEnabled || snap.edgeLightEnabled
         let needsFace = snap.studioLightEnabled || snap.autoFramingEnabled || snap.skinPolishStrength > 0.01
-        let visionPB = compositor.makeVisionInputBuffer(from: camPB)
+        let visionPB = compositor.makeVisionInputBuffer(from: camPB, quality: snap.segmentationQuality)
 
         if needsSegmentation || needsFace {
             let desiredQuality: VNGeneratePersonSegmentationRequest.QualityLevel
