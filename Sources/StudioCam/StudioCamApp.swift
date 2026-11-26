@@ -552,7 +552,8 @@ enum HeadlessStudioBenchmark {
         let stabilizedRMS = sqrt(sqDiffSum / Double(max(1, sqDiffCount)))
         let suppressionFactor = rawBaselineRMS / max(1e-5, stabilizedRMS)
 
-        // 2. Verify instant motion release (hand/head moves right from x=50% to x=65% on a single frame!)
+        // 2. Verify instant motion release on BOTH bright AND worst-case low-contrast dark-shirt-over-dark-wall side-to-side sway!
+        // 2a. Leading edge snap (person shifts right from x=50% to x=65% on a single frame)
         let moveCam = try makeNoisyCam(frame: 25, shiftedRight: true)
         let moveMask = try makeFlickeringMask(frame: 25, shiftedRight: true)
         var motionCaptureRatio = 0.0
@@ -569,15 +570,96 @@ enum HeadlessStudioBenchmark {
             produceSink: false,
             waitForGPUCompletion: true
         ) {
-            // Check newly uncovered person zone between x=54% and x=61% — should snap immediately to ~0.78 luma (zero ghost lag!)
             let movedZone = sampleEdgeBandLuma(res.mainPixelBuffer, xMin: Int(Double(w) * 0.54), xMax: Int(Double(w) * 0.61))
             let meanLuma = movedZone.reduce(0.0, +) / Double(max(1, movedZone.count))
             motionCaptureRatio = (meanLuma / 0.78) * 100.0
         }
 
+        // 2b. Worst-case low-contrast side-to-side sway: dark shirt (RGB ~0.22) moving LEFT off dark wall (RGB ~0.18 -> tiny colorDiff 0.04!)
+        func makeLowContrastSwayFrame(frame: Int, bodyCenterX: Double) throws -> (CVPixelBuffer, CVPixelBuffer) {
+            let attrs: [CFString: Any] = [kCVPixelBufferIOSurfacePropertiesKey: [:], kCVPixelBufferMetalCompatibilityKey: true]
+            var camOpt: CVPixelBuffer?
+            CVPixelBufferCreate(kCFAllocatorDefault, w, h, kCVPixelFormatType_32BGRA, attrs as CFDictionary, &camOpt)
+            let camPB = camOpt!
+            CVPixelBufferLockBaseAddress(camPB, [])
+            let cBase = CVPixelBufferGetBaseAddress(camPB)!.assumingMemoryBound(to: UInt8.self)
+            let cBPR = CVPixelBufferGetBytesPerRow(camPB)
+            var rng: UInt32 = UInt32(truncatingIfNeeded: frame) &* 2654435761 &+ 9973
+            let minX = Int((bodyCenterX - 0.14) * Double(w))
+            let maxX = Int((bodyCenterX + 0.14) * Double(w))
+            for y in 0..<h {
+                let row = cBase + y * cBPR
+                for x in 0..<w {
+                    rng = rng &* 1664525 &+ 1013904223
+                    let n = Int((rng >> 24) % 7) - 3
+                    let inBody = (x >= minX && x <= maxX)
+                    let baseV = inBody ? 56 : 46 // Only 10/255 (~0.039) separation!
+                    let v = UInt8(max(0, min(255, baseV + n)))
+                    row[x * 4 + 0] = v
+                    row[x * 4 + 1] = v
+                    row[x * 4 + 2] = v
+                    row[x * 4 + 3] = 255
+                }
+            }
+            CVPixelBufferUnlockBaseAddress(camPB, [])
+
+            var maskOpt: CVPixelBuffer?
+            CVPixelBufferCreate(kCFAllocatorDefault, maskW, maskH, kCVPixelFormatType_OneComponent8, attrs as CFDictionary, &maskOpt)
+            let mPB = maskOpt!
+            CVPixelBufferLockBaseAddress(mPB, [])
+            let mBase = CVPixelBufferGetBaseAddress(mPB)!.assumingMemoryBound(to: UInt8.self)
+            let mBPR = CVPixelBufferGetBytesPerRow(mPB)
+            let mMinX = (bodyCenterX - 0.14) * Double(maskW)
+            let mMaxX = (bodyCenterX + 0.14) * Double(maskW)
+            for y in 0..<maskH {
+                let row = mBase + y * mBPR
+                for x in 0..<maskW {
+                    let dx = max(mMinX - Double(x), Double(x) - mMaxX)
+                    let alpha = max(0.0, min(1.0, 0.5 - dx / 4.0))
+                    row[x] = UInt8(alpha * 255.0)
+                }
+            }
+            CVPixelBufferUnlockBaseAddress(mPB, [])
+            return (camPB, mPB)
+        }
+
+        compositor.resetTemporalHistory()
+        // Settle stationary dark shirt at x=0.58 for 10 frames
+        for f in 0..<10 {
+            let (cPB, mPB) = try makeLowContrastSwayFrame(frame: f, bodyCenterX: 0.58)
+            _ = compositor.renderFrame(
+                outputDimensions: (w, h), cameraPixelBuffer: cPB, segmentationMaskBuffer: mPB,
+                backgroundVideoBuffer: nil, backgroundStaticTexture: nil, sceneDepthTexture: nil,
+                faceRect: SIMD4(0.58, 0.42, 0.16, 0.24), cameraCropRect: SIMD4(0, 0, 1, 1),
+                settings: snap, produceSink: false, waitForGPUCompletion: true
+            )
+        }
+        // Now rapidly sway body LEFT to x=0.36 on 1 frame -> inspect vacated trailing wake [0.56..0.68] (should be ~0.0% ghost!)
+        let (swayCam, swayMask) = try makeLowContrastSwayFrame(frame: 11, bodyCenterX: 0.36)
+        var trailingGhostPct = 100.0
+        var lowContrastLeadingPct = 0.0
+        if let res = compositor.renderFrame(
+            outputDimensions: (w, h), cameraPixelBuffer: swayCam, segmentationMaskBuffer: swayMask,
+            backgroundVideoBuffer: nil, backgroundStaticTexture: nil, sceneDepthTexture: nil,
+            faceRect: SIMD4(0.36, 0.42, 0.16, 0.24), cameraCropRect: SIMD4(0, 0, 1, 1),
+            settings: snap, produceSink: false, waitForGPUCompletion: true
+        ) {
+            let wakeZone = sampleEdgeBandLuma(res.mainPixelBuffer, xMin: Int(Double(w) * 0.56), xMax: Int(Double(w) * 0.68))
+            let wakeMean = wakeZone.reduce(0.0, +) / Double(max(1, wakeZone.count))
+            trailingGhostPct = (wakeMean / (56.0 / 255.0)) * 100.0
+
+            let leadZone = sampleEdgeBandLuma(res.mainPixelBuffer, xMin: Int(Double(w) * 0.26), xMax: Int(Double(w) * 0.38))
+            let leadMean = leadZone.reduce(0.0, +) / Double(max(1, leadZone.count))
+            lowContrastLeadingPct = (leadMean / (56.0 / 255.0)) * 100.0
+        }
+
         print(String(
             format: "Raw Unstabilized RMS: %.4f -> Stabilized RMS: %.4f (%.1f× shimmer reduction) | 1-Frame Motion Snap: %.1f%%",
             rawBaselineRMS, stabilizedRMS, suppressionFactor, motionCaptureRatio
+        ))
+        print(String(
+            format: "Fast Low-Contrast Sway (dark shirt on dark wall): Trailing Ghost Residual: %.2f%% | Leading Body Snap: %.1f%%",
+            trailingGhostPct, lowContrastLeadingPct
         ))
     }
 

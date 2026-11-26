@@ -147,17 +147,37 @@ kernel void guidedPrepAndTemporalEMA(
         float3 prevRGB = prev.rgb;
         float prevMask = prev.a;
 
-        // Pure camera-color similarity weight (identical to Portrait.framework's
-        // temporalFilterExponentialMovingAverageColorSimilarities):
-        // Steady camera RGB -> lock strongly to temporal EMA (kills Vision boundary flicker);
-        // Real head/hand movement -> camera RGB shifts -> instant release with zero ghost trail.
-        float colorDiff = length(smoothRGB - prevRGB);
-        float simWeight = exp(-(colorDiff * colorDiff) / max(1e-5f, 2.0f * u.colorSimSigma * u.colorSimSigma));
+        // 1. Shadow-sensitive Weber + Absolute RGB Color-Similarity Weight
+        // Catches low-contrast movement (e.g. dark shirt swaying across a shadowed office wall)
+        // while staying rock-locked on stationary 5-tap denoised webcam ISO grain.
+        float absDiff = length(smoothRGB - prevRGB);
+        float refLuma = max(0.24f, max(rgbLuma(smoothRGB), rgbLuma(prevRGB)));
+        float weberDiff = absDiff / refLuma;
+        float motionMag = max(absDiff, weberDiff * 0.32f);
+        float simWeight = exp(-(motionMag * motionMag) / max(1e-5f, 2.0f * u.colorSimSigma * u.colorSimSigma));
 
-        // Edge-band pixels (0.04..0.96) get maximum temporal stability; deep solid interior stays crisp
-        float blend = saturate(u.temporalBlend * simWeight);
+        // 2. Wide-stencil (±2 guide texels ≈ ±7.5px at 1080p) Coherent-Flip Ghost Buster
+        // Stationary 1–6px Vision edge shimmer straddles the boundary (mWakeMin low, mWakeMax high) -> stays locked.
+        // Fast side-to-side body sway creates a coherent vacated wake (mWakeMax < 0.25) or newly covered body
+        // (mWakeMin > 0.75) -> flushes trailing & leading ghosts to 0 on frame 1 even on identical shirt/wall colors!
+        float2 wakeStep = invGrid * 2.0f;
+        float wL = saturate(rawMaskTex.sample(linSamp, uv + float2(-wakeStep.x, 0.0f)).r);
+        float wR = saturate(rawMaskTex.sample(linSamp, uv + float2( wakeStep.x, 0.0f)).r);
+        float wU = saturate(rawMaskTex.sample(linSamp, uv + float2(0.0f, -wakeStep.y)).r);
+        float wD = saturate(rawMaskTex.sample(linSamp, uv + float2(0.0f,  wakeStep.y)).r);
+        float mWakeMax = max(m0, max(max(wL, wR), max(wU, wD)));
+        float mWakeMin = min(m0, min(min(wL, wR), min(wU, wD)));
+
+        float wakeGone = smoothstep(0.35f, 0.65f, prevMask) * (1.0f - smoothstep(0.12f, 0.34f, mWakeMax));
+        float bodyArrived = (1.0f - smoothstep(0.35f, 0.65f, prevMask)) * smoothstep(0.66f, 0.88f, mWakeMin);
+        // Only release on large coherent flips (>0.46); normal stationary Vision shimmer stays below ~0.35
+        float largeJump = smoothstep(0.46f, 0.76f, abs(p - prevMask));
+        float ghostFlush = saturate(max(max(wakeGone, bodyArrived), largeJump));
+
+        float blend = saturate(u.temporalBlend * simWeight * (1.0f - ghostFlush));
         p = mix(p, prevMask, blend);
-        nextStoredRGB = mix(smoothRGB, prevRGB, blend * 0.65f);
+        // Keep stored reference RGB crisp so rapid consecutive sway frames never smear into prevRGB
+        nextStoredRGB = mix(smoothRGB, prevRGB, blend * 0.20f);
     }
 
     float luma = rgbLuma(smoothRGB);

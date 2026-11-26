@@ -303,14 +303,14 @@ public final class MetalStudioCompositor {
             currentGuideMaskTex = nextHist
             pingHistoryToggle.toggle()
 
-            // Noise-safe eps=0.016 + radius=3 + strong stationary temporal lock (0.70..0.94)
+            // Noise-safe eps=0.016 + radius=3 + strong stationary temporal lock (0.70..0.94) + crisp 0.036 motion release
             let tempBlend = Float(0.70 + 0.24 * max(0.0, min(1.0, settings.temporalStability)))
             var gu = GuidedUniformsGPU(
                 gridSize: SIMD2(UInt32(guideWidth), UInt32(guideHeight)),
                 radius: 3,
                 eps: 0.016,
                 temporalBlend: tempBlend,
-                colorSimSigma: 0.052,
+                colorSimSigma: 0.036,
                 hasHistory: hasHistory ? 1 : 0,
                 camIsYUV: camIsYUV ? 1 : 0,
                 camFullRange: camFullRange ? 1 : 0
