@@ -205,6 +205,12 @@ enum HeadlessStudioBenchmark {
             _ = depthReadySem.wait(timeout: .now() + 30.0)
             print("Scene Depth Engine: \(depthAnalyzer.statusLabel)")
 
+            let mattingEngine = NeuralMattingEngine()
+            let matteSem = DispatchSemaphore(value: 0)
+            mattingEngine.prepareModelsAsync { matteSem.signal() }
+            _ = matteSem.wait(timeout: .now() + 30.0)
+            print("Neural Matting Engine: \(mattingEngine.statusSummary)")
+
             let sampleLUTs = LUTLoader.ensureSampleLUTsExist()
             let loadedLUT = try LUTLoader.loadCubeLUT(from: sampleLUTs[0], device: compositor.device)
             compositor.setActiveLUT(loadedLUT)
@@ -224,10 +230,15 @@ enum HeadlessStudioBenchmark {
                 label: String,
                 preset: CaptureResolutionPreset,
                 bgMode: BackgroundMode,
+                segMode: SegmentationQualityPreset = .balancedANE,
                 frames: Int = 60
             ) throws {
                 let outDims = preset.resolvedDimensions(clientHint: clientDims)
                 let camPB = try makeSyntheticNV12CameraFrame(width: outDims.width, height: outDims.height)
+                if segMode == .cleanPlateBGMv2 {
+                    let emptyPB = try makeSyntheticCleanPlate512()
+                    mattingEngine.setSyntheticCleanPlate(emptyPB, for: "benchCam")
+                }
 
                 let bgController = BackgroundMediaController(device: compositor.device)
                 bgController.setTargetDecodeDimensions(width: outDims.width, height: outDims.height)
@@ -241,7 +252,7 @@ enum HeadlessStudioBenchmark {
 
                 let snap = RenderSettingsSnapshot(
                     resolution: preset,
-                    segmentationQuality: .balancedANE,
+                    segmentationQuality: segMode,
                     backgroundMode: bgMode,
                     gradientPreset: StudioGradientPreset.presets[0],
                     portraitEnabled: true,
@@ -286,13 +297,19 @@ enum HeadlessStudioBenchmark {
 
                 // Warmup 6 frames
                 for _ in 0..<6 {
-                    let vIn = compositor.makeVisionInputBuffer(from: camPB)
-                    try seqHandler.perform([segReq], on: vIn, orientation: .up)
+                    let vIn = compositor.makeVisionInputBuffer(from: camPB, quality: segMode)
+                    let maskPB: CVPixelBuffer?
+                    if let coreMLOut = mattingEngine.predictAlphaMask(liveBGRA512: vIn, mode: segMode, cameraID: "benchCam") {
+                        maskPB = coreMLOut.mask
+                    } else {
+                        try seqHandler.perform([segReq], on: vIn, orientation: .up)
+                        maskPB = segReq.results?.first?.pixelBuffer
+                    }
                     let (vPB, sTex) = bgController.currentBackgroundFrame()
                     _ = compositor.renderFrame(
                         outputDimensions: outDims,
                         cameraPixelBuffer: camPB,
-                        segmentationMaskBuffer: segReq.results?.first?.pixelBuffer,
+                        segmentationMaskBuffer: maskPB,
                         backgroundVideoBuffer: vPB,
                         backgroundStaticTexture: sTex,
                         sceneDepthTexture: depthAnalyzer.depthTexture,
@@ -314,15 +331,21 @@ enum HeadlessStudioBenchmark {
                         RunLoop.main.run(until: Date().addingTimeInterval(0.002))
                     }
                     let tANE0 = CACurrentMediaTime()
-                    let vIn = compositor.makeVisionInputBuffer(from: camPB)
-                    try seqHandler.perform([segReq], on: vIn, orientation: .up)
+                    let vIn = compositor.makeVisionInputBuffer(from: camPB, quality: segMode)
+                    let maskPB: CVPixelBuffer?
+                    if let coreMLOut = mattingEngine.predictAlphaMask(liveBGRA512: vIn, mode: segMode, cameraID: "benchCam") {
+                        maskPB = coreMLOut.mask
+                    } else {
+                        try seqHandler.perform([segReq], on: vIn, orientation: .up)
+                        maskPB = segReq.results?.first?.pixelBuffer
+                    }
                     aneTotalMs += (CACurrentMediaTime() - tANE0) * 1000.0
 
                     let (vPB, sTex) = bgController.currentBackgroundFrame()
                     if let res = compositor.renderFrame(
                         outputDimensions: outDims,
                         cameraPixelBuffer: camPB,
-                        segmentationMaskBuffer: segReq.results?.first?.pixelBuffer,
+                        segmentationMaskBuffer: maskPB,
                         backgroundVideoBuffer: vPB,
                         backgroundStaticTexture: sTex,
                         sceneDepthTexture: depthAnalyzer.depthTexture,
@@ -355,10 +378,11 @@ enum HeadlessStudioBenchmark {
                 ))
             }
 
-            print("\n--- All Standout v2.0 Effects Active (3D ANE Depth Bokeh + Light Wrap + Color Match + LUT + Grain + Skin Polish) ---")
-            try benchmarkPipeline(label: "1. Auto (Teams/Meet 1080p) Real Room Hallway", preset: .autoClient, bgMode: .none)
-            try benchmarkPipeline(label: "2. Auto (Teams/Meet 1080p) + Video Room BG", preset: .autoClient, bgMode: .video)
-            try benchmarkPipeline(label: "3. Explicit 4K UHD Creator + Video Room BG", preset: .uhd4K, bgMode: .video)
+            print("\n--- All Standout Effects Active (LKT Flow + FMLFE Decontam + 3D Depth Bokeh + Light Wrap + LUT + Grain) ---")
+            try benchmarkPipeline(label: "1. Auto 1080p + Clean-Plate BGMv2 ANE (MIT)", preset: .autoClient, bgMode: .video, segMode: .cleanPlateBGMv2)
+            try benchmarkPipeline(label: "2. Auto 1080p + MODNet Portrait ANE (Apache)", preset: .autoClient, bgMode: .video, segMode: .modnetWebcamANE)
+            try benchmarkPipeline(label: "3. Auto 1080p Real Room Hallway (MODNet ANE)", preset: .autoClient, bgMode: .none, segMode: .modnetWebcamANE)
+            try benchmarkPipeline(label: "4. Explicit 4K UHD + Clean-Plate BGMv2 ANE", preset: .uhd4K, bgMode: .video, segMode: .cleanPlateBGMv2)
 
             print("\n--- Real-World Matte Shimmer & Motion-Release Stress Test (Noisy Webcam + ±0.30 Stateless Mask Flicker) ---")
             try runTemporalShimmerStressTest(compositor: compositor)
@@ -715,6 +739,34 @@ enum HeadlessStudioBenchmark {
                 print("Bright Skin Highlight (In 223,193,195 @ StudioLight 100% + LUT): Out (\(or_),\(og),\(ob)) -> \(clipped)")
             }
         }
+    }
+
+    private static func makeSyntheticCleanPlate512() throws -> CVPixelBuffer {
+        let w = 512, h = 288
+        let attrs: [CFString: Any] = [
+            kCVPixelBufferIOSurfacePropertiesKey: [:],
+            kCVPixelBufferMetalCompatibilityKey: true
+        ]
+        var pbOpt: CVPixelBuffer?
+        CVPixelBufferCreate(kCFAllocatorDefault, w, h, kCVPixelFormatType_32BGRA, attrs as CFDictionary, &pbOpt)
+        guard let pb = pbOpt else { throw NSError(domain: "Bench", code: 2) }
+        CVPixelBufferLockBaseAddress(pb, [])
+        defer { CVPixelBufferUnlockBaseAddress(pb, []) }
+        if let base = CVPixelBufferGetBaseAddress(pb)?.assumingMemoryBound(to: UInt8.self) {
+            let bpr = CVPixelBufferGetBytesPerRow(pb)
+            for y in 0..<h {
+                let row = base + y * bpr
+                for x in 0..<w {
+                    let nx = Float(x) / Float(w)
+                    let wall = UInt8(min(220, max(35, Int(45.0 + abs(nx - 0.72) * 180.0))))
+                    row[x * 4 + 0] = wall
+                    row[x * 4 + 1] = wall
+                    row[x * 4 + 2] = wall
+                    row[x * 4 + 3] = 255
+                }
+            }
+        }
+        return pb
     }
 
     private static func makeSyntheticNV12CameraFrame(width w: Int, height h: Int) throws -> CVPixelBuffer {

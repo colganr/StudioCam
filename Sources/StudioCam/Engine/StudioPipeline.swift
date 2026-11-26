@@ -27,13 +27,18 @@ public final class StudioPipeline: NSObject, ObservableObject, @unchecked Sendab
     @Published public private(set) var gpuMsTelemetry: Double = 0
     @Published public private(set) var aneMsTelemetry: Double = 0
     @Published public private(set) var resolutionTelemetry: String = "Idle (0% CPU/GPU)"
+    @Published public private(set) var cleanPlateCountdown: Int = 0
+    @Published public private(set) var hasCleanPlateForActiveCamera: Bool = false
 
     @MainActor public var isPopoverVisible: Bool = false { didSet { updatePowerState() } }
     @MainActor public var isCleanWindowVisible: Bool = false { didSet { updatePowerState() } }
+    @MainActor private var isCapturingCleanPlate: Bool = false { didSet { updatePowerState() } }
+    private var cleanPlateTimer: Timer?
 
     public let compositor: MetalStudioCompositor
     public let bgMedia: BackgroundMediaController
     public let depthAnalyzer: SceneDepthAnalyzer
+    public let mattingEngine = NeuralMattingEngine()
     public let sinkBridge = CMIOSinkBridge()
     private let ringLight: ScreenRingLightController
 
@@ -129,8 +134,23 @@ public final class StudioPipeline: NSObject, ObservableObject, @unchecked Sendab
         }
 
         refreshCameras()
+        syncCleanPlateStatusForSelectedCamera(autoSelectIfPresent: true)
         restoreCustomBackgroundIfNeeded()
         observeCameraHotplugNotifications()
+
+        mattingEngine.onCleanPlateCaptured = { [weak self] camID in
+            Task { @MainActor in
+                guard let self = self else { return }
+                self.isCapturingCleanPlate = false
+                self.cleanPlateCountdown = 0
+                if camID == self.settings.selectedCameraUniqueID {
+                    self.hasCleanPlateForActiveCamera = true
+                    self.settings.segmentationQuality = .cleanPlateBGMv2
+                }
+                self.compositor.resetTemporalHistory()
+                NSSound(named: NSSound.Name("Glass"))?.play()
+            }
+        }
     }
 
     @MainActor
@@ -242,8 +262,60 @@ public final class StudioPipeline: NSObject, ObservableObject, @unchecked Sendab
     public func selectCamera(uniqueID: String) {
         guard settings.selectedCameraUniqueID != uniqueID else { return }
         settings.selectedCameraUniqueID = uniqueID
+        syncCleanPlateStatusForSelectedCamera(autoSelectIfPresent: true)
         depthAnalyzer.invalidateSceneCache()
         reconfigureCaptureInput()
+    }
+
+    @MainActor
+    public func syncCleanPlateStatusForSelectedCamera(autoSelectIfPresent: Bool = false) {
+        let hasPlate = mattingEngine.hasCleanPlate(for: settings.selectedCameraUniqueID)
+        hasCleanPlateForActiveCamera = hasPlate
+        if autoSelectIfPresent && hasPlate {
+            settings.segmentationQuality = .cleanPlateBGMv2
+        }
+    }
+
+    /// Starts a 3-second audible & visual step-aside countdown, then averages 6 empty-room frames
+    /// to eliminate 100% of ergonomic mesh chair & desk false positives via MIT BackgroundMattingV2!
+    @MainActor
+    public func startCleanPlateCountdown() {
+        cleanPlateTimer?.invalidate()
+        let camID = settings.selectedCameraUniqueID
+        guard !camID.isEmpty else { return }
+
+        cleanPlateCountdown = 3
+        isCapturingCleanPlate = true
+        NSSound(named: NSSound.Name("Tink"))?.play()
+
+        cleanPlateTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] timer in
+            Task { @MainActor in
+                guard let self = self else { timer.invalidate(); return }
+                if self.cleanPlateCountdown > 1 {
+                    self.cleanPlateCountdown -= 1
+                    NSSound(named: NSSound.Name("Tink"))?.play()
+                } else {
+                    timer.invalidate()
+                    self.cleanPlateTimer = nil
+                    self.cleanPlateCountdown = -1 // -1 indicates "Sampling 6-frame denoised plate…"
+                    self.mattingEngine.armCleanPlateCapture(for: camID)
+                }
+            }
+        }
+    }
+
+    @MainActor
+    public func clearCleanPlateForSelectedCamera() {
+        cleanPlateTimer?.invalidate()
+        cleanPlateTimer = nil
+        cleanPlateCountdown = 0
+        isCapturingCleanPlate = false
+        mattingEngine.clearCleanPlate(for: settings.selectedCameraUniqueID)
+        hasCleanPlateForActiveCamera = false
+        if settings.segmentationQuality == .cleanPlateBGMv2 {
+            settings.segmentationQuality = .balancedANE
+        }
+        compositor.resetTemporalHistory()
     }
 
     @MainActor
@@ -334,7 +406,7 @@ public final class StudioPipeline: NSObject, ObservableObject, @unchecked Sendab
 
     @MainActor
     public func updatePowerState() {
-        let shouldRun = isPopoverVisible || isCleanWindowVisible || settings.virtualCamEnabled || isRecording
+        let shouldRun = isPopoverVisible || isCleanWindowVisible || settings.virtualCamEnabled || isRecording || isCapturingCleanPlate
         if shouldRun && !isPipelineRunning {
             startPipeline()
         } else if !shouldRun && isPipelineRunning {
@@ -608,25 +680,49 @@ extension StudioPipeline: AVCaptureVideoDataOutputSampleBufferDelegate {
         let outDims = resolvePipelineDimensions(for: snap)
         frameIndex &+= 1
 
-        // 1. ANE Person Segmentation + Face Tracking (for Studio Light, Skin Polish, and Auto-Framing)
+        // 1. ANE Person Matting (BGMv2 Clean-Plate 3.7ms / MODNet 4.8ms / Vision Fallback) + Face Tracking
+        let activeCamID = activeDeviceInput?.device.uniqueID ?? ""
         let needsSegmentation = (snap.backgroundMode != .none) || snap.portraitEnabled || snap.studioLightEnabled || snap.edgeLightEnabled
         let needsFace = snap.studioLightEnabled || snap.autoFramingEnabled || snap.skinPolishStrength > 0.01
-        let visionPB = compositor.makeVisionInputBuffer(from: camPB, quality: snap.segmentationQuality)
+
+        // Always feed 512x288 BGRA if clean-plate capture is armed OR if running BGMv2 / MODNet on ANE
+        let useCoreMLMatting = (snap.segmentationQuality == .cleanPlateBGMv2 || snap.segmentationQuality == .modnetWebcamANE)
+        let visionPB = compositor.makeVisionInputBuffer(
+            from: camPB,
+            quality: useCoreMLMatting ? snap.segmentationQuality : snap.segmentationQuality
+        )
+
+        if CVPixelBufferGetWidth(visionPB) == NeuralMattingEngine.width {
+            mattingEngine.ingestFrameIfCapturing(visionPB, cameraID: activeCamID)
+        } else {
+            let pb512 = compositor.makeVisionInputBuffer(from: camPB, quality: .cleanPlateBGMv2)
+            mattingEngine.ingestFrameIfCapturing(pb512, cameraID: activeCamID)
+        }
 
         if needsSegmentation || needsFace {
+            var didRunCoreMLSegmentation = false
+            if needsSegmentation && useCoreMLMatting {
+                let t0 = CACurrentMediaTime()
+                if let result = mattingEngine.predictAlphaMask(liveBGRA512: visionPB, mode: snap.segmentationQuality, cameraID: activeCamID) {
+                    let aneMs = (CACurrentMediaTime() - t0) * 1000.0
+                    smoothedANEMs = (smoothedANEMs == 0) ? aneMs : (smoothedANEMs * 0.88 + aneMs * 0.12)
+                    cachedMaskBuffer = result.mask
+                    didRunCoreMLSegmentation = true
+                }
+            }
+
             let desiredQuality: VNGeneratePersonSegmentationRequest.QualityLevel
             switch snap.segmentationQuality {
             case .fastVideoCall: desiredQuality = .fast
-            case .balancedANE: desiredQuality = .balanced
             case .accurateMax: desiredQuality = .accurate
+            case .cleanPlateBGMv2, .modnetWebcamANE, .balancedANE: desiredQuality = .balanced
             }
             if segRequest.qualityLevel != desiredQuality {
                 segRequest.qualityLevel = desiredQuality
             }
 
             var requests: [VNRequest] = []
-            if needsSegmentation { requests.append(segRequest) }
-            // Run face tracking at 1.5 Hz (every 20 frames) instead of 6 Hz to avoid Vision CPU spikes!
+            if needsSegmentation && !didRunCoreMLSegmentation { requests.append(segRequest) }
             if needsFace && (frameIndex % 20 == 1) { requests.append(faceRequest) }
             if snap.reactionsGestureEnabled && (frameIndex % 15 == 1) { requests.append(handRequest) }
 
@@ -634,12 +730,12 @@ extension StudioPipeline: AVCaptureVideoDataOutputSampleBufferDelegate {
                 let t0 = CACurrentMediaTime()
                 try? visionSequenceHandler.perform(requests, on: visionPB, orientation: .up)
                 let aneMs = (CACurrentMediaTime() - t0) * 1000.0
-                if needsSegmentation {
+                if needsSegmentation && !didRunCoreMLSegmentation {
                     smoothedANEMs = (smoothedANEMs == 0) ? aneMs : (smoothedANEMs * 0.88 + aneMs * 0.12)
                 }
             }
 
-            if needsSegmentation, let maskObs = segRequest.results?.first {
+            if needsSegmentation && !didRunCoreMLSegmentation, let maskObs = segRequest.results?.first {
                 cachedMaskBuffer = maskObs.pixelBuffer
             }
             if needsFace, let face = faceRequest.results?.first {

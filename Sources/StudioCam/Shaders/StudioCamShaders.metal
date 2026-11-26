@@ -108,16 +108,96 @@ inline float3 sampleCameraRGB(
     return plane0.sample(linSamp, pUV).rgb;
 }
 
-// Pass 1: 3x3 denoised guide + Portrait.framework-faithful RGB Color-Similarity Temporal EMA
-// Gates temporal lock STRICTLY on denoised camera RGB motion (never on raw Vision mask jumps),
-// crushing frame-to-frame Vision edge shimmer by ~8x while remaining instant when you move.
-kernel void guidedPrepAndTemporalEMA(
+// ============================================================================
+// Pass 0a: Coarse 128x72 Luma Pyramid for 2-Level Pyramidal Lucas-Kanade (LKT)
+// ============================================================================
+kernel void downsampleLumaCoarse(
     texture2d<float, access::sample> camPlane0 [[texture(0)]],
     texture2d<float, access::sample> camPlane1 [[texture(1)]],
-    texture2d<float, access::sample> rawMaskTex [[texture(2)]],
-    texture2d<float, access::read>   prevGuideAndMask [[texture(3)]],
+    texture2d<float, access::write>  lumaOut   [[texture(2)]],
+    constant uint2& camFlags [[buffer(0)]], // x=camIsYUV, y=camFullRange
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint2 sz = uint2(lumaOut.get_width(), lumaOut.get_height());
+    if (gid.x >= sz.x || gid.y >= sz.y) return;
+    constexpr sampler linSamp(coord::normalized, address::clamp_to_edge, filter::linear);
+    float2 invSz = 1.0f / float2(sz);
+    float2 baseUV = (float2(gid) + 0.5f) * invSz;
+    float2 q = invSz * 0.25f;
+
+    float3 c0 = sampleCameraRGB(camPlane0, camPlane1, linSamp, baseUV + float2(-q.x, -q.y), camFlags.x, camFlags.y);
+    float3 c1 = sampleCameraRGB(camPlane0, camPlane1, linSamp, baseUV + float2( q.x, -q.y), camFlags.x, camFlags.y);
+    float3 c2 = sampleCameraRGB(camPlane0, camPlane1, linSamp, baseUV + float2(-q.x,  q.y), camFlags.x, camFlags.y);
+    float3 c3 = sampleCameraRGB(camPlane0, camPlane1, linSamp, baseUV + float2( q.x,  q.y), camFlags.x, camFlags.y);
+    float luma = 0.25f * (rgbLuma(c0) + rgbLuma(c1) + rgbLuma(c2) + rgbLuma(c3));
+    lumaOut.write(float4(luma, 0.0f, 0.0f, 1.0f), gid);
+}
+
+// ============================================================================
+// Pass 0b: Coarse 5x5 Lucas-Kanade Optical Flow (replicates Portrait.framework LKT)
+// Outputs normalized UV velocity (currUV - prevUV) so prevTex(uv - flowUV) aligns to curr!
+// ============================================================================
+kernel void computeLKCoarseFlow(
+    texture2d<float, access::sample> currLuma [[texture(0)]],
+    texture2d<float, access::sample> prevLuma [[texture(1)]],
+    texture2d<float, access::write>  flowOut  [[texture(2)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint2 sz = uint2(flowOut.get_width(), flowOut.get_height());
+    if (gid.x >= sz.x || gid.y >= sz.y) return;
+    constexpr sampler linSamp(coord::normalized, address::clamp_to_edge, filter::linear);
+    float2 invSz = 1.0f / float2(sz);
+    float2 uv = (float2(gid) + 0.5f) * invSz;
+
+    float sXX = 0.0f, sYY = 0.0f, sXY = 0.0f;
+    float bX = 0.0f, bY = 0.0f;
+
+    for (int dy = -2; dy <= 2; ++dy) {
+        for (int dx = -2; dx <= 2; ++dx) {
+            float2 pUV = uv + float2(dx, dy) * invSz;
+            float iC = currLuma.sample(linSamp, pUV).r;
+            float iP = prevLuma.sample(linSamp, pUV).r;
+            float iR = currLuma.sample(linSamp, pUV + float2( invSz.x, 0.0f)).r;
+            float iL = currLuma.sample(linSamp, pUV + float2(-invSz.x, 0.0f)).r;
+            float iD = currLuma.sample(linSamp, pUV + float2(0.0f,  invSz.y)).r;
+            float iU = currLuma.sample(linSamp, pUV + float2(0.0f, -invSz.y)).r;
+
+            float ix = 0.5f * (iR - iL);
+            float iy = 0.5f * (iD - iU);
+            float it = iC - iP;
+
+            sXX += ix * ix;
+            sYY += iy * iy;
+            sXY += ix * iy;
+            bX  -= ix * it;
+            bY  -= iy * it;
+        }
+    }
+
+    // Tikhonov aperture regularization damps flow cleanly to 0 on flat untextured walls
+    const float reg = 0.0035f;
+    sXX += reg;
+    sYY += reg;
+    float det = sXX * sYY - sXY * sXY;
+    float2 flowPx = float2(0.0f);
+    if (det > 1e-6f) {
+        flowPx = float2(sYY * bX - sXY * bY, -sXY * bX + sXX * bY) / det;
+        flowPx = clamp(flowPx, float2(-4.0f), float2(4.0f));
+    }
+    flowOut.write(float4(flowPx * invSz, 0.0f, 0.0f), gid);
+}
+
+// Pass 1: 3x3 denoised guide + Pyramidal LKT Motion-Warped Color-Similarity Temporal EMA
+// Warps previous mask along Lucas-Kanade optical flow vectors (matching Apple Portrait.framework
+// temporalFilterEMA_LKT), keeping moving edges calm while flushing disocclusion wakes in 1 frame.
+kernel void guidedPrepAndTemporalEMA(
+    texture2d<float, access::sample> camPlane0        [[texture(0)]],
+    texture2d<float, access::sample> camPlane1        [[texture(1)]],
+    texture2d<float, access::sample> rawMaskTex       [[texture(2)]],
+    texture2d<float, access::sample> prevGuideAndMask [[texture(3)]],
     texture2d<float, access::write>  nextGuideAndMask [[texture(4)]],
-    texture2d<float, access::write>  statsOut [[texture(5)]],
+    texture2d<float, access::write>  statsOut         [[texture(5)]],
+    texture2d<float, access::sample> coarseFlowTex    [[texture(6)]],
     constant GuidedUniforms& u [[buffer(0)]],
     uint2 gid [[thread_position_in_grid]]
 ) {
@@ -134,8 +214,9 @@ kernel void guidedPrepAndTemporalEMA(
     float3 cU = sampleCameraRGB(camPlane0, camPlane1, linSamp, uv + float2(0.0f, -invGrid.y), u.camIsYUV, u.camFullRange);
     float3 cD = sampleCameraRGB(camPlane0, camPlane1, linSamp, uv + float2(0.0f,  invGrid.y), u.camIsYUV, u.camFullRange);
     float3 smoothRGB = 0.40f * c0 + 0.15f * (cL + cR + cU + cD);
+    float luma = rgbLuma(smoothRGB);
 
-    // 5-tap spatial anti-pop on raw Vision mask before temporal integration
+    // 5-tap spatial anti-pop on raw neural mask before temporal integration
     float m0 = saturate(rawMaskTex.sample(linSamp, uv).r);
     float mL = saturate(rawMaskTex.sample(linSamp, uv + float2(-invGrid.x, 0.0f)).r);
     float mR = saturate(rawMaskTex.sample(linSamp, uv + float2( invGrid.x, 0.0f)).r);
@@ -145,23 +226,29 @@ kernel void guidedPrepAndTemporalEMA(
 
     float3 nextStoredRGB = smoothRGB;
     if (u.hasHistory != 0) {
-        float4 prev = prevGuideAndMask.read(gid);
+        // 1-step fine LKT refinement on top of coarse 128x72 optical flow vector
+        float2 flowUV = coarseFlowTex.sample(linSamp, uv).rg;
+        float2 warpedUV = clamp(uv - flowUV, float2(0.001f), float2(0.999f));
+        float prevWarpedLuma = rgbLuma(prevGuideAndMask.sample(linSamp, warpedUV).rgb);
+        float gx = 0.5f * (rgbLuma(cR) - rgbLuma(cL));
+        float gy = 0.5f * (rgbLuma(cD) - rgbLuma(cU));
+        float gt = luma - prevWarpedLuma;
+        float denom = gx * gx + gy * gy + 0.004f;
+        float2 fineFlowPx = clamp(float2(-gx * gt, -gy * gt) / denom, float2(-1.5f), float2(1.5f));
+        warpedUV = clamp(warpedUV - fineFlowPx * invGrid, float2(0.001f), float2(0.999f));
+
+        float4 prev = prevGuideAndMask.sample(linSamp, warpedUV);
         float3 prevRGB = prev.rgb;
         float prevMask = prev.a;
 
-        // 1. Shadow-sensitive Weber + Absolute RGB Color-Similarity Weight
-        // Catches low-contrast movement (e.g. dark shirt swaying across a shadowed office wall)
-        // while staying rock-locked on stationary 5-tap denoised webcam ISO grain.
+        // 1. Shadow-sensitive Weber + Absolute RGB residual on LKT-warped correspondence
         float absDiff = length(smoothRGB - prevRGB);
-        float refLuma = max(0.24f, max(rgbLuma(smoothRGB), rgbLuma(prevRGB)));
+        float refLuma = max(0.24f, max(luma, rgbLuma(prevRGB)));
         float weberDiff = absDiff / refLuma;
         float motionMag = max(absDiff, weberDiff * 0.32f);
         float simWeight = exp(-(motionMag * motionMag) / max(1e-5f, 2.0f * u.colorSimSigma * u.colorSimSigma));
 
-        // 2. Wide-stencil (±2 guide texels ≈ ±7.5px at 1080p) Coherent-Flip Ghost Buster
-        // Stationary 1–6px Vision edge shimmer straddles the boundary (mWakeMin low, mWakeMax high) -> stays locked.
-        // Fast side-to-side body sway creates a coherent vacated wake (mWakeMax < 0.25) or newly covered body
-        // (mWakeMin > 0.75) -> flushes trailing & leading ghosts to 0 on frame 1 even on identical shirt/wall colors!
+        // 2. Wide-stencil (±2 guide texels ≈ ±7.5px at 1080p) Coherent Disocclusion Ghost Buster
         float2 wakeStep = invGrid * 2.0f;
         float wL = saturate(rawMaskTex.sample(linSamp, uv + float2(-wakeStep.x, 0.0f)).r);
         float wR = saturate(rawMaskTex.sample(linSamp, uv + float2( wakeStep.x, 0.0f)).r);
@@ -172,19 +259,94 @@ kernel void guidedPrepAndTemporalEMA(
 
         float wakeGone = smoothstep(0.35f, 0.65f, prevMask) * (1.0f - smoothstep(0.12f, 0.34f, mWakeMax));
         float bodyArrived = (1.0f - smoothstep(0.35f, 0.65f, prevMask)) * smoothstep(0.66f, 0.88f, mWakeMin);
-        // Only release on large coherent flips (>0.46); normal stationary Vision shimmer stays below ~0.35
         float largeJump = smoothstep(0.46f, 0.76f, abs(p - prevMask));
         float ghostFlush = saturate(max(max(wakeGone, bodyArrived), largeJump));
 
         float blend = saturate(u.temporalBlend * simWeight * (1.0f - ghostFlush));
         p = mix(p, prevMask, blend);
-        // Keep stored reference RGB crisp so rapid consecutive sway frames never smear into prevRGB
         nextStoredRGB = mix(smoothRGB, prevRGB, blend * 0.20f);
     }
 
-    float luma = rgbLuma(smoothRGB);
     nextGuideAndMask.write(float4(nextStoredRGB, p), gid);
     statsOut.write(float4(luma, p, luma * luma, luma * p), gid);
+}
+
+// ============================================================================
+// Fast Multi-Level Foreground Color Estimation (FMLFE — Germer et al. 2020)
+// Solves I = alpha*F + (1-alpha)*B for pure decontaminated Foreground F in O(1)
+// via a 2-level (128x72 coarse + 512x288 fine) alpha^2-weighted blur pyramid!
+// ============================================================================
+kernel void fmlfeCoarseHorizontal(
+    texture2d<float, access::sample> guideMask [[texture(0)]],
+    texture2d<float, access::write>  tempOut   [[texture(1)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint2 sz = uint2(tempOut.get_width(), tempOut.get_height());
+    if (gid.x >= sz.x || gid.y >= sz.y) return;
+    constexpr sampler linSamp(coord::normalized, address::clamp_to_edge, filter::linear);
+    float2 invSz = 1.0f / float2(sz);
+    float2 uv = (float2(gid) + 0.5f) * invSz;
+
+    float4 acc = float4(0.0f);
+    for (int dx = -8; dx <= 8; ++dx) {
+        float4 gm = guideMask.sample(linSamp, uv + float2(float(dx) * invSz.x, 0.0f));
+        // Weight strictly toward solid interior foreground (alpha^2) so contaminated outer wisps have ~0 weight!
+        float w = gm.a * gm.a * smoothstep(0.35f, 0.85f, gm.a);
+        acc += float4(gm.rgb * w, w);
+    }
+    tempOut.write(acc, gid);
+}
+
+kernel void fmlfeCoarseVertical(
+    texture2d<float, access::read>  tempIn    [[texture(0)]],
+    texture2d<float, access::write> coarseOut [[texture(1)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint2 sz = uint2(coarseOut.get_width(), coarseOut.get_height());
+    if (gid.x >= sz.x || gid.y >= sz.y) return;
+    int maxY = int(sz.y) - 1;
+    float4 acc = float4(0.0f);
+    for (int dy = -8; dy <= 8; ++dy) {
+        int sy = clamp(int(gid.y) + dy, 0, maxY);
+        acc += tempIn.read(uint2(gid.x, sy));
+    }
+    float3 fgCoarse = (acc.w > 1e-4f) ? (acc.rgb / acc.w) : float3(0.0f);
+    coarseOut.write(float4(fgCoarse, saturate(acc.w * 2.0f)), gid);
+}
+
+kernel void fmlfeFineRefine(
+    texture2d<float, access::read>   guideMask [[texture(0)]],
+    texture2d<float, access::sample> coarseFG  [[texture(1)]],
+    texture2d<float, access::write>  fmlfeOut  [[texture(2)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint2 sz = uint2(fmlfeOut.get_width(), fmlfeOut.get_height());
+    if (gid.x >= sz.x || gid.y >= sz.y) return;
+    constexpr sampler linSamp(coord::normalized, address::clamp_to_edge, filter::linear);
+
+    int maxX = int(sz.x) - 1;
+    int maxY = int(sz.y) - 1;
+    float3 sumRGB = float3(0.0f);
+    float sumW = 0.0f;
+
+    // 5x5 stride-2 fine interior gather (±4 guide texels ≈ ±15px at 1080p)
+    for (int dy = -2; dy <= 2; ++dy) {
+        int sy = clamp(int(gid.y) + dy * 2, 0, maxY);
+        for (int dx = -2; dx <= 2; ++dx) {
+            int sx = clamp(int(gid.x) + dx * 2, 0, maxX);
+            float4 gm = guideMask.read(uint2(sx, sy));
+            float w = gm.a * gm.a * smoothstep(0.45f, 0.90f, gm.a);
+            sumRGB += gm.rgb * w;
+            sumW += w;
+        }
+    }
+
+    float2 uv = (float2(gid) + 0.5f) / float2(sz);
+    float4 cFG = coarseFG.sample(linSamp, uv);
+    float3 fineEst = (sumW > 1e-3f) ? (sumRGB / sumW) : cFG.rgb;
+    float fineConf = saturate(sumW * 1.5f);
+    float3 fusedFG = mix(cFG.rgb, fineEst, fineConf);
+    fmlfeOut.write(float4(fusedFG, max(cFG.a, fineConf)), gid);
 }
 
 // Pass 2a: Separable horizontal box filter
@@ -356,6 +518,7 @@ kernel void compositeStudioFrame(
     texture2d<float, access::sample> farBokehTex    [[texture(8)]],
     texture2d<float, access::sample> sceneDepthTex  [[texture(9)]],
     texture2d<float, access::sample> guideMaskTex   [[texture(10)]],
+    texture2d<float, access::sample> fmlfeTex       [[texture(11)]],
     constant CompositeUniforms& u [[buffer(0)]],
     uint2 gid [[thread_position_in_grid]]
 ) {
@@ -520,13 +683,24 @@ kernel void compositeStudioFrame(
             fgLuma = rgbLuma(fgRGB);
         }
 
-        // 4b. Semi-transparent hair spill suppression
-        if (alpha > 0.03f && alpha < 0.94f && u.spillSuppression > 0.01f) {
-            float edgeBand = 4.0f * alpha * (1.0f - alpha);
-            float3 neutralFG = float3(fgLuma);
-            float bgLuma = max(0.05f, rgbLuma(bgRGB));
-            float3 ambientTintedFG = neutralFG * mix(float3(1.0f), bgRGB / bgLuma, 0.28f);
-            fgRGB = mix(fgRGB, ambientTintedFG, edgeBand * u.spillSuppression * 0.65f);
+        // 4b. Fast Multi-Level Foreground Color Estimation (FMLFE) Hair & Edge Decontamination
+        // Replaces room/chair color spill inside semi-transparent hair strands & backlit rims with true extrapolated
+        // interior subject color while preserving crisp 4K strand luminance detail!
+        if (alpha > 0.02f && alpha < 0.96f && u.spillSuppression > 0.01f) {
+            float4 fmlfe = fmlfeTex.sample(linSamp, camUV);
+            if (fmlfe.a > 0.05f) {
+                float3 estPureFG = fmlfe.rgb;
+                if (fabs(camGamma - 1.0f) > 0.005f) {
+                    estPureFG = pow(max(estPureFG, float3(1e-5f)), float3(camGamma));
+                }
+                // Preserve local high-frequency strand brightness variation around the clean FMLFE color
+                float estLuma = max(0.04f, rgbLuma(estPureFG));
+                float strandRatio = clamp(fgLuma / estLuma, 0.65f, 1.35f);
+                float3 decontamFG = saturate(estPureFG * mix(1.0f, strandRatio, 0.65f));
+                float edgeWeight = (1.0f - smoothstep(0.55f, 0.96f, alpha)) * fmlfe.a * saturate(u.spillSuppression);
+                fgRGB = mix(fgRGB, decontamFG, edgeWeight * 0.85f);
+                fgLuma = rgbLuma(fgRGB);
+            }
         }
 
         // 4c. Highlight-Safe Screen-Mode Optical Light Wrap (bleeds bright BG softly without ever clipping hands/fingers!)

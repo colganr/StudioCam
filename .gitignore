@@ -4,9 +4,11 @@ build/
 .swiftpm/
 Package.resolved
 
-# Generated local sample assets (auto-generated at runtime in ~/Library/Application Support/StudioCam)
+# Generated local sample assets & Core ML model binaries (auto-generated in ~/Library/Application Support/StudioCam)
 SampleBackgrounds/
 SampleLUTs/
+*.mlpackage/
+*.mlmodelc/
 
 # Local research notes & binary dumps (keep repo 100% clean-room source)
 docs/

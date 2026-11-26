@@ -69,10 +69,15 @@ public final class MetalStudioCompositor {
     public let commandQueue: MTLCommandQueue
     private var textureCache: CVMetalTextureCache!
 
+    private let psoLumaCoarse: MTLComputePipelineState
+    private let psoLKCoarseFlow: MTLComputePipelineState
     private let psoGuidedPrep: MTLComputePipelineState
     private let psoBoxH: MTLComputePipelineState
     private let psoBoxV: MTLComputePipelineState
     private let psoSmoothAB: MTLComputePipelineState
+    private let psoFMLFECoarseH: MTLComputePipelineState
+    private let psoFMLFECoarseV: MTLComputePipelineState
+    private let psoFMLFEFine: MTLComputePipelineState
     private let psoDownsampleHalf: MTLComputePipelineState
     private let psoOpticalBokehDisc: MTLComputePipelineState
     private let psoComposite: MTLComputePipelineState
@@ -80,6 +85,11 @@ public final class MetalStudioCompositor {
 
     private let guideWidth = 512
     private let guideHeight = 288
+    private let coarseWidth = 128
+    private let coarseHeight = 72
+    private var lumaCoarseA: MTLTexture
+    private var lumaCoarseB: MTLTexture
+    private var coarseFlowTex: MTLTexture
     private var historyTexA: MTLTexture
     private var historyTexB: MTLTexture
     private var pingHistoryToggle = false
@@ -89,6 +99,9 @@ public final class MetalStudioCompositor {
     private var boxTempTex: MTLTexture
     private var abRawTex: MTLTexture
     private var abSmoothTex: MTLTexture
+    private var fmlfeTempTex: MTLTexture
+    private var fmlfeCoarseTex: MTLTexture
+    private var fmlfeFineTex: MTLTexture
     private var dummy1x1Tex: MTLTexture
     private var fallbackDepthTex: MTLTexture
     private var dummy3DLUTTex: MTLTexture
@@ -134,7 +147,7 @@ public final class MetalStudioCompositor {
         let lib: MTLLibrary
         if let metallibURL = Bundle.main.url(forResource: "default", withExtension: "metallib"),
            let precompiled = try? dev.makeLibrary(URL: metallibURL),
-           precompiled.makeFunction(name: "opticalBokehDiscPass") != nil {
+           precompiled.makeFunction(name: "fmlfeFineRefine") != nil {
             lib = precompiled
         } else {
             let opts = MTLCompileOptions()
@@ -149,28 +162,39 @@ public final class MetalStudioCompositor {
             return try dev.makeComputePipelineState(function: fn)
         }
 
+        self.psoLumaCoarse = try makePSO("downsampleLumaCoarse")
+        self.psoLKCoarseFlow = try makePSO("computeLKCoarseFlow")
         self.psoGuidedPrep = try makePSO("guidedPrepAndTemporalEMA")
         self.psoBoxH = try makePSO("boxFilterHorizontal")
         self.psoBoxV = try makePSO("boxFilterVerticalAndCoeffs")
         self.psoSmoothAB = try makePSO("smoothGuidedCoeffs")
+        self.psoFMLFECoarseH = try makePSO("fmlfeCoarseHorizontal")
+        self.psoFMLFECoarseV = try makePSO("fmlfeCoarseVertical")
+        self.psoFMLFEFine = try makePSO("fmlfeFineRefine")
         self.psoDownsampleHalf = try makePSO("downsampleHalfBGRA")
         self.psoOpticalBokehDisc = try makePSO("opticalBokehDiscPass")
         self.psoComposite = try makePSO("compositeStudioFrame")
         self.psoScaleSink = try makePSO("scaleBGRAForSink")
 
-        func makeGuideTex(_ fmt: MTLPixelFormat) -> MTLTexture {
-            let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: fmt, width: 512, height: 288, mipmapped: false)
+        func makeGuideTex(_ fmt: MTLPixelFormat, w: Int = 512, h: Int = 288) -> MTLTexture {
+            let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: fmt, width: w, height: h, mipmapped: false)
             d.usage = [.shaderRead, .shaderWrite]
             d.storageMode = .private
             return dev.makeTexture(descriptor: d)!
         }
 
+        self.lumaCoarseA = makeGuideTex(.r16Float, w: 128, h: 72)
+        self.lumaCoarseB = makeGuideTex(.r16Float, w: 128, h: 72)
+        self.coarseFlowTex = makeGuideTex(.rg16Float, w: 128, h: 72)
         self.historyTexA = makeGuideTex(.rgba16Float)
         self.historyTexB = makeGuideTex(.rgba16Float)
         self.statsTex = makeGuideTex(.rgba16Float)
         self.boxTempTex = makeGuideTex(.rgba16Float)
         self.abRawTex = makeGuideTex(.rg16Float)
         self.abSmoothTex = makeGuideTex(.rg16Float)
+        self.fmlfeTempTex = makeGuideTex(.rgba16Float, w: 128, h: 72)
+        self.fmlfeCoarseTex = makeGuideTex(.rgba16Float, w: 128, h: 72)
+        self.fmlfeFineTex = makeGuideTex(.rgba16Float)
 
         let d1 = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm, width: 1, height: 1, mipmapped: false)
         d1.usage = [.shaderRead]
@@ -217,13 +241,22 @@ public final class MetalStudioCompositor {
     }
 
     public func makeVisionInputBuffer(from cameraPixelBuffer: CVPixelBuffer, quality: SegmentationQualityPreset = .balancedANE) -> CVPixelBuffer {
-        // Give Balanced/Accurate Vision a crisp 960x540 input (clean hair/shoulder anti-aliasing!)
-        // and only downscale to 640x360 when Ultra-Light (.fast) is explicitly selected.
-        let targetW = (quality == .fastVideoCall) ? 640 : 960
-        let targetH = (quality == .fastVideoCall) ? 360 : 540
+        // Core ML ANE models (BGMv2 Clean-Plate & MODNet Webcam) run natively at 512x288 (16:9) —
+        // GPU-downscaling directly into a 512x288 IOSurface BGRA buffer avoids CPU Vision/CoreML resize!
+        let targetW: Int
+        let targetH: Int
+        switch quality {
+        case .cleanPlateBGMv2, .modnetWebcamANE:
+            targetW = 512; targetH = 288
+        case .fastVideoCall:
+            targetW = 640; targetH = 360
+        case .balancedANE, .accurateMax:
+            targetW = 960; targetH = 540
+        }
         let w = CVPixelBufferGetWidth(cameraPixelBuffer)
         let h = CVPixelBufferGetHeight(cameraPixelBuffer)
-        if w <= targetW && h <= targetH {
+        let fmt = CVPixelBufferGetPixelFormatType(cameraPixelBuffer)
+        if w == targetW && h == targetH && fmt == kCVPixelFormatType_32BGRA {
             return cameraPixelBuffer
         }
         if visionInputPool == nil || visionPoolSize != (targetW, targetH) {
@@ -294,16 +327,17 @@ public final class MetalStudioCompositor {
 
         guard let cmd = commandQueue.makeCommandBuffer() else { return nil }
 
-        // 1. Noise-Safe Guided-Filter Hair Matte + Pure RGB Color-Similarity Temporal EMA
+        // 1. Pyramidal LKT Optical Flow + Noise-Safe Guided-Filter Hair Matte + FMLFE Foreground Decontamination
         let needsMask = (settings.backgroundMode != .none) || settings.portraitEnabled || settings.studioLightEnabled || settings.edgeLightEnabled
         var currentGuideMaskTex: MTLTexture = pingHistoryToggle ? historyTexB : historyTexA
         if needsMask, let maskPB = segmentationMaskBuffer, let maskTex = makeSinglePlaneR8Texture(from: maskPB) {
             let prevHist = pingHistoryToggle ? historyTexB : historyTexA
             let nextHist = pingHistoryToggle ? historyTexA : historyTexB
+            let prevLumaC = pingHistoryToggle ? lumaCoarseB : lumaCoarseA
+            let currLumaC = pingHistoryToggle ? lumaCoarseA : lumaCoarseB
             currentGuideMaskTex = nextHist
             pingHistoryToggle.toggle()
 
-            // Noise-safe eps=0.016 + radius=3 + strong stationary temporal lock (0.70..0.94) + crisp 0.036 motion release
             let tempBlend = Float(0.70 + 0.24 * max(0.0, min(1.0, settings.temporalStability)))
             var gu = GuidedUniformsGPU(
                 gridSize: SIMD2(UInt32(guideWidth), UInt32(guideHeight)),
@@ -315,12 +349,31 @@ public final class MetalStudioCompositor {
                 camIsYUV: camIsYUV ? 1 : 0,
                 camFullRange: camFullRange ? 1 : 0
             )
+            let hadHist = hasHistory
             hasHistory = true
 
             if let enc = cmd.makeComputeCommandEncoder() {
                 let tg = MTLSize(width: 16, height: 16, depth: 1)
+                let coarseGrid = MTLSize(width: coarseWidth, height: coarseHeight, depth: 1)
                 let grid = MTLSize(width: guideWidth, height: guideHeight, depth: 1)
 
+                // Pass 0a: Coarse 128x72 Luma
+                var camFlags = SIMD2<UInt32>(camIsYUV ? 1 : 0, camFullRange ? 1 : 0)
+                enc.setComputePipelineState(psoLumaCoarse)
+                enc.setTexture(camPlane0, index: 0)
+                enc.setTexture(camPlane1, index: 1)
+                enc.setTexture(currLumaC, index: 2)
+                enc.setBytes(&camFlags, length: MemoryLayout<SIMD2<UInt32>>.stride, index: 0)
+                enc.dispatchThreads(coarseGrid, threadsPerThreadgroup: tg)
+
+                // Pass 0b: Coarse 5x5 Lucas-Kanade Optical Flow
+                enc.setComputePipelineState(psoLKCoarseFlow)
+                enc.setTexture(currLumaC, index: 0)
+                enc.setTexture(hadHist ? prevLumaC : currLumaC, index: 1)
+                enc.setTexture(coarseFlowTex, index: 2)
+                enc.dispatchThreads(coarseGrid, threadsPerThreadgroup: tg)
+
+                // Pass 1: LKT-Warped Temporal EMA + Guided Stats
                 enc.setComputePipelineState(psoGuidedPrep)
                 enc.setTexture(camPlane0, index: 0)
                 enc.setTexture(camPlane1, index: 1)
@@ -328,9 +381,11 @@ public final class MetalStudioCompositor {
                 enc.setTexture(prevHist, index: 3)
                 enc.setTexture(nextHist, index: 4)
                 enc.setTexture(statsTex, index: 5)
+                enc.setTexture(coarseFlowTex, index: 6)
                 enc.setBytes(&gu, length: MemoryLayout<GuidedUniformsGPU>.stride, index: 0)
                 enc.dispatchThreads(grid, threadsPerThreadgroup: tg)
 
+                // Pass 2a..2c: Separable O(1) Guided Filter
                 enc.setComputePipelineState(psoBoxH)
                 enc.setTexture(statsTex, index: 0)
                 enc.setTexture(boxTempTex, index: 1)
@@ -348,6 +403,25 @@ public final class MetalStudioCompositor {
                 enc.setTexture(abSmoothTex, index: 1)
                 enc.setBytes(&gu, length: MemoryLayout<GuidedUniformsGPU>.stride, index: 0)
                 enc.dispatchThreads(grid, threadsPerThreadgroup: tg)
+
+                // Pass 2d..2f: Fast Multi-Level Foreground Color Estimation (FMLFE) for Hair/Edge Decontamination
+                if settings.backgroundMode != .none && settings.spillSuppression > 0.01 {
+                    enc.setComputePipelineState(psoFMLFECoarseH)
+                    enc.setTexture(nextHist, index: 0)
+                    enc.setTexture(fmlfeTempTex, index: 1)
+                    enc.dispatchThreads(coarseGrid, threadsPerThreadgroup: tg)
+
+                    enc.setComputePipelineState(psoFMLFECoarseV)
+                    enc.setTexture(fmlfeTempTex, index: 0)
+                    enc.setTexture(fmlfeCoarseTex, index: 1)
+                    enc.dispatchThreads(coarseGrid, threadsPerThreadgroup: tg)
+
+                    enc.setComputePipelineState(psoFMLFEFine)
+                    enc.setTexture(nextHist, index: 0)
+                    enc.setTexture(fmlfeCoarseTex, index: 1)
+                    enc.setTexture(fmlfeFineTex, index: 2)
+                    enc.dispatchThreads(grid, threadsPerThreadgroup: tg)
+                }
 
                 enc.endEncoding()
             }
@@ -517,6 +591,7 @@ public final class MetalStudioCompositor {
             enc.setTexture(farOutTex, index: 8)
             enc.setTexture(depthTex, index: 9)
             enc.setTexture(currentGuideMaskTex, index: 10)
+            enc.setTexture(fmlfeFineTex, index: 11)
             enc.setBytes(&cu, length: MemoryLayout<CompositeUniformsGPU>.stride, index: 0)
             enc.dispatchThreads(
                 MTLSize(width: outW, height: outH, depth: 1),

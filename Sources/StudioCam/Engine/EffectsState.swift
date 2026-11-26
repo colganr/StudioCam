@@ -56,16 +56,20 @@ public enum CaptureResolutionPreset: String, Codable, CaseIterable, Identifiable
 }
 
 public enum SegmentationQualityPreset: String, Codable, CaseIterable, Identifiable, Sendable {
-    case fastVideoCall = "fast"
+    case cleanPlateBGMv2 = "cleanplate"
+    case modnetWebcamANE = "modnet"
     case balancedANE = "balanced"
+    case fastVideoCall = "fast"
     case accurateMax = "accurate"
 
     public var id: String { rawValue }
     public var title: String {
         switch self {
-        case .fastVideoCall: return "Ultra-Light (Calls) + Guided Hair"
-        case .balancedANE: return "Balanced ANE + Guided Hair"
-        case .accurateMax: return "Max Neural + Guided Hair"
+        case .cleanPlateBGMv2: return "Clean-Plate Studio ANE (Zero Chair Leak)"
+        case .modnetWebcamANE: return "MODNet Portrait ANE (4.8 ms)"
+        case .balancedANE: return "Apple Vision Balanced + LKT"
+        case .fastVideoCall: return "Apple Vision Ultra-Light"
+        case .accurateMax: return "Apple Vision Max Neural"
         }
     }
 }
@@ -232,7 +236,7 @@ public final class StudioSettings: ObservableObject {
     // Default to Auto (Match Client) so 1080p Teams/Meet calls run natively at 1080p with zero 4K downsample!
     // Default to Balanced ANE (512x384) — never .fast — for calm, hair-accurate video call edges!
     @Published public var resolution: CaptureResolutionPreset = .autoClient { didSet { syncSnapshot() } }
-    @Published public var segmentationQuality: SegmentationQualityPreset = .balancedANE { didSet { syncSnapshot() } }
+    @Published public var segmentationQuality: SegmentationQualityPreset = .modnetWebcamANE { didSet { syncSnapshot() } }
 
     @Published public var portraitEnabled: Bool = true { didSet { syncSnapshot() } }
     @Published public var portraitStrength: Float = 0.62 { didSet { syncSnapshot() } }
@@ -418,7 +422,7 @@ public final class StudioSettings: ObservableObject {
     private func savePersisted() {
         let d = UserDefaults.standard
         d.set(resolution.rawValue, forKey: "sc.resolutionV2")
-        d.set(segmentationQuality.rawValue, forKey: "sc.segQualityV3")
+        d.set(segmentationQuality.rawValue, forKey: "sc.segQualityV4")
         d.set(matteChoke, forKey: "sc.matteChoke")
         d.set(temporalStability, forKey: "sc.temporalStability")
         d.set(portraitEnabled, forKey: "sc.portrait")
@@ -452,7 +456,7 @@ public final class StudioSettings: ObservableObject {
     private func loadPersisted() {
         let d = UserDefaults.standard
         if let r = d.string(forKey: "sc.resolutionV2"), let p = CaptureResolutionPreset(rawValue: r) { resolution = p }
-        if let q = d.string(forKey: "sc.segQualityV3"), let p = SegmentationQualityPreset(rawValue: q) { segmentationQuality = p }
+        if let q = d.string(forKey: "sc.segQualityV4"), let p = SegmentationQualityPreset(rawValue: q) { segmentationQuality = p }
         if d.object(forKey: "sc.matteChoke") != nil { matteChoke = d.float(forKey: "sc.matteChoke") }
         if d.object(forKey: "sc.temporalStability") != nil { temporalStability = d.float(forKey: "sc.temporalStability") }
         if d.object(forKey: "sc.portrait") != nil { portraitEnabled = d.bool(forKey: "sc.portrait") }

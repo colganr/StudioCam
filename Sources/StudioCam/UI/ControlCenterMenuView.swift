@@ -209,6 +209,21 @@ public struct ControlCenterMenuView: View {
             .frame(width: 400, height: 225)
             .background(Color.black)
 
+            if pipeline.cleanPlateCountdown != 0 {
+                VStack(spacing: 6) {
+                    Text(pipeline.cleanPlateCountdown > 0
+                         ? "Step Out of Frame — \(pipeline.cleanPlateCountdown)…"
+                         : "Sampling Denoised Clean Plate…")
+                        .font(.system(size: 14, weight: .bold))
+                        .foregroundStyle(.white)
+                    Text("Learning your empty chair & room so zero chair mesh ever leaks")
+                        .font(.system(size: 10.5, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.85))
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(Color.black.opacity(0.62))
+            }
+
             if settings.isDropTargeted {
                 RoundedRectangle(cornerRadius: 8)
                     .strokeBorder(Color.cyan, style: StrokeStyle(lineWidth: 2, dash: [6]))
@@ -677,6 +692,55 @@ public struct ControlCenterMenuView: View {
                     .foregroundStyle(.white.opacity(0.65))
                 Slider(value: $settings.edgeSoftness, in: 0.08...0.95)
                     .controlSize(.mini)
+            }
+
+            // 1-Click Empty Chair / Room Clean-Plate Bar (MIT BackgroundMattingV2 on ANE — 0.000 Chair Leak!)
+            HStack(spacing: 6) {
+                Button {
+                    pipeline.startCleanPlateCountdown()
+                } label: {
+                    HStack(spacing: 5) {
+                        Image(systemName: pipeline.hasCleanPlateForActiveCamera ? "checkmark.shield.fill" : "chair.lounge.fill")
+                            .font(.system(size: 10.5, weight: .semibold))
+                        Text(
+                            pipeline.cleanPlateCountdown > 0
+                            ? "Step Aside… \(pipeline.cleanPlateCountdown)s"
+                            : (pipeline.hasCleanPlateForActiveCamera ? "Re-Learn Empty Chair (3s)" : "Learn Empty Chair / Room (3s)")
+                        )
+                        .font(.system(size: 11, weight: .medium))
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 5)
+                    .background(
+                        RoundedRectangle(cornerRadius: 6).fill(
+                            pipeline.cleanPlateCountdown != 0
+                            ? Color.orange.opacity(0.85)
+                            : (pipeline.hasCleanPlateForActiveCamera ? Color.green.opacity(0.24) : Color.white.opacity(0.11))
+                        )
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 6).stroke(
+                            pipeline.hasCleanPlateForActiveCamera ? Color.green.opacity(0.65) : Color.white.opacity(0.14),
+                            lineWidth: 1
+                        )
+                    )
+                    .foregroundStyle(pipeline.hasCleanPlateForActiveCamera && pipeline.cleanPlateCountdown == 0 ? Color.green : Color.white)
+                }
+                .buttonStyle(.plain)
+                .help("Step out of frame for 3 seconds once so MIT BackgroundMattingV2 learns your empty chair & room (0% chair leak)")
+
+                if pipeline.hasCleanPlateForActiveCamera {
+                    Button("Clear") {
+                        pipeline.clearCleanPlateForSelectedCamera()
+                    }
+                    .font(.system(size: 10.5, weight: .medium))
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 5)
+                    .background(Color.white.opacity(0.09), in: RoundedRectangle(cornerRadius: 6))
+                    .foregroundStyle(.white.opacity(0.78))
+                    .buttonStyle(.plain)
+                    .help("Remove saved clean plate for this camera")
+                }
             }
 
             Picker("Matte Engine", selection: $settings.segmentationQuality) {
