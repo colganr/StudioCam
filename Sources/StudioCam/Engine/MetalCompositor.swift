@@ -272,7 +272,8 @@ public final class MetalStudioCompositor {
         cameraCropRect: SIMD4<Float>,
         settings: RenderSettingsSnapshot,
         produceSink: Bool,
-        sinkDimensions: (width: Int, height: Int) = (1920, 1080)
+        sinkDimensions: (width: Int, height: Int) = (1920, 1080),
+        waitForGPUCompletion: Bool = true
     ) -> RenderResult? {
         let outW = outputDimensions.width
         let outH = outputDimensions.height
@@ -548,7 +549,12 @@ public final class MetalStudioCompositor {
         }
 
         cmd.commit()
-        cmd.waitUntilScheduled()
+        if waitForGPUCompletion {
+            // Guarantees GPU has finished writing every IOSurface pixel before CALayer preview & Teams/OBS read it (~0.8-1.5ms)
+            cmd.waitUntilCompleted()
+        } else {
+            cmd.waitUntilScheduled()
+        }
 
         return RenderResult(mainPixelBuffer: outPB, mainTexture: outTex, sinkPixelBuffer: sinkPBOut)
     }

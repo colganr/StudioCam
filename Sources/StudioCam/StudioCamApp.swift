@@ -28,7 +28,9 @@ struct StudioCamMenuApp: App {
                     pipeline: pipeline,
                     settings: appController.settings,
                     prompter: pipeline.prompter,
-                    onToggleCleanWindow: { appController.toggleCleanFeedWindow() }
+                    isPoppedOutWindow: false,
+                    onToggleCleanWindow: { appController.toggleCleanFeedWindow() },
+                    onTogglePopoutControls: { appController.togglePopoutControlsWindow() }
                 )
             } else {
                 Text(appController.startupError ?? "Starting StudioCam…")
@@ -49,6 +51,7 @@ final class StudioCamAppController: ObservableObject {
     @Published var isActive: Bool = false
 
     private var cleanWindow: NSWindow?
+    private var popoutControlsWindow: NSWindow?
 
     init() {
         do {
@@ -92,11 +95,51 @@ final class StudioCamAppController: ObservableObject {
         }
     }
 
+    func togglePopoutControlsWindow() {
+        if let w = popoutControlsWindow, w.isVisible {
+            w.close()
+            popoutControlsWindow = nil
+            pipeline?.isCleanWindowVisible = (cleanWindow?.isVisible == true)
+            return
+        }
+        guard let pipeline = pipeline else { return }
+
+        let w = NSWindow(
+            contentRect: NSRect(x: 160, y: 140, width: 400, height: 740),
+            styleMask: [.titled, .closable, .miniaturizable],
+            backing: .buffered,
+            defer: false
+        )
+        w.title = "StudioCam Controls"
+        w.isReleasedWhenClosed = false
+        w.level = .floating
+        w.contentView = NSHostingView(
+            rootView: ControlCenterMenuView(
+                pipeline: pipeline,
+                settings: settings,
+                prompter: pipeline.prompter,
+                isPoppedOutWindow: true,
+                onToggleCleanWindow: { [weak self] in self?.toggleCleanFeedWindow() },
+                onTogglePopoutControls: { [weak self] in self?.togglePopoutControlsWindow() }
+            )
+        )
+        NotificationCenter.default.addObserver(forName: NSWindow.willCloseNotification, object: w, queue: .main) { [weak self] _ in
+            Task { @MainActor in
+                self?.popoutControlsWindow = nil
+                self?.pipeline?.isCleanWindowVisible = (self?.cleanWindow?.isVisible == true)
+            }
+        }
+        w.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        popoutControlsWindow = w
+        pipeline.isCleanWindowVisible = true
+    }
+
     func toggleCleanFeedWindow() {
         if let w = cleanWindow, w.isVisible {
             w.close()
             cleanWindow = nil
-            pipeline?.isCleanWindowVisible = false
+            pipeline?.isCleanWindowVisible = (popoutControlsWindow?.isVisible == true)
             return
         }
         guard let pipeline = pipeline else { return }
@@ -112,17 +155,15 @@ final class StudioCamAppController: ObservableObject {
         w.backgroundColor = .black
         w.contentView = NSHostingView(
             rootView: MetalPreviewView(
-                device: pipeline.compositor.device,
-                commandQueue: pipeline.compositor.commandQueue,
                 registerFrameProvider: { handler in
-                    pipeline.onFrameRendered = handler
+                    pipeline.addFrameSubscriber(handler)
                 }
             )
         )
         NotificationCenter.default.addObserver(forName: NSWindow.willCloseNotification, object: w, queue: .main) { [weak self] _ in
             Task { @MainActor in
-                self?.pipeline?.isCleanWindowVisible = false
                 self?.cleanWindow = nil
+                self?.pipeline?.isCleanWindowVisible = (self?.popoutControlsWindow?.isVisible == true)
             }
         }
         w.makeKeyAndOrderFront(nil)

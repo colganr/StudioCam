@@ -9,18 +9,24 @@ public struct ControlCenterMenuView: View {
     @ObservedObject var pipeline: StudioPipeline
     @ObservedObject var settings: StudioSettings
     @ObservedObject var prompter: LensPrompterController
+    let isPoppedOutWindow: Bool
     let onToggleCleanWindow: () -> Void
+    let onTogglePopoutControls: () -> Void
 
     public init(
         pipeline: StudioPipeline,
         settings: StudioSettings,
         prompter: LensPrompterController,
-        onToggleCleanWindow: @escaping () -> Void
+        isPoppedOutWindow: Bool = false,
+        onToggleCleanWindow: @escaping () -> Void,
+        onTogglePopoutControls: @escaping () -> Void
     ) {
         self.pipeline = pipeline
         self.settings = settings
         self.prompter = prompter
+        self.isPoppedOutWindow = isPoppedOutWindow
         self.onToggleCleanWindow = onToggleCleanWindow
+        self.onTogglePopoutControls = onTogglePopoutControls
     }
 
     public var body: some View {
@@ -30,21 +36,26 @@ public struct ControlCenterMenuView: View {
             previewStage
             cameraAndResolutionBar
             Divider().overlay(Color.white.opacity(0.08))
-            ScrollView(.vertical, showsIndicators: false) {
+            ScrollView(.vertical, showsIndicators: true) {
                 effectsStack
             }
-            .frame(maxHeight: 340)
+            // Explicit height prevents MenuBarExtra(.window) from collapsing ScrollView to 0 px!
+            .frame(height: 375)
             Divider().overlay(Color.white.opacity(0.08))
             footerTelemetryBar
         }
-        .frame(width: 362)
+        .frame(width: 400)
         .background(Color(nsColor: NSColor(calibratedRed: 0.11, green: 0.13, blue: 0.16, alpha: 0.97)))
         .onAppear {
             pipeline.refreshCameras()
-            pipeline.isPopoverVisible = true
+            if !isPoppedOutWindow {
+                pipeline.isPopoverVisible = true
+            }
         }
         .onDisappear {
-            pipeline.isPopoverVisible = false
+            if !isPoppedOutWindow {
+                pipeline.isPopoverVisible = false
+            }
         }
         .onDrop(of: [.fileURL], isTargeted: $settings.isDropTargeted) { providers in
             handleDrop(providers: providers)
@@ -81,6 +92,22 @@ public struct ControlCenterMenuView: View {
             }
 
             Spacer()
+
+            // Pop-Out Persistent Controls Window Button (stays open beside Teams while adjusting sliders!)
+            if !isPoppedOutWindow {
+                Button {
+                    onTogglePopoutControls()
+                } label: {
+                    Image(systemName: "arrow.up.left.and.arrow.down.right")
+                        .font(.system(size: 10.5, weight: .semibold))
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 5)
+                        .background(Capsule().fill(Color.white.opacity(0.09)))
+                        .foregroundStyle(.white.opacity(0.82))
+                }
+                .buttonStyle(.plain)
+                .help("Pop out StudioCam controls into a floating window beside Teams")
+            }
 
             // Quick Lens Prompter Toggle (Invisible to Screen Share)
             Button {
@@ -175,13 +202,11 @@ public struct ControlCenterMenuView: View {
     private var previewStage: some View {
         ZStack(alignment: .bottomTrailing) {
             MetalPreviewView(
-                device: pipeline.compositor.device,
-                commandQueue: pipeline.compositor.commandQueue,
                 registerFrameProvider: { handler in
-                    pipeline.onFrameRendered = handler
+                    pipeline.addFrameSubscriber(handler)
                 }
             )
-            .frame(width: 362, height: 204)
+            .frame(width: 400, height: 225)
             .background(Color.black)
 
             if settings.isDropTargeted {
@@ -639,6 +664,15 @@ public struct ControlCenterMenuView: View {
                 Slider(value: $settings.edgeSoftness, in: 0.05...0.95)
                     .controlSize(.mini)
             }
+
+            Picker("Matte Engine", selection: $settings.segmentationQuality) {
+                ForEach(SegmentationQualityPreset.allCases) { q in
+                    Text(q.title).tag(q)
+                }
+            }
+            .font(.system(size: 10.5))
+            .controlSize(.mini)
+            .foregroundStyle(.white.opacity(0.75))
         }
     }
 

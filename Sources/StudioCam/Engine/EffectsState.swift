@@ -56,13 +56,15 @@ public enum CaptureResolutionPreset: String, Codable, CaseIterable, Identifiable
 }
 
 public enum SegmentationQualityPreset: String, Codable, CaseIterable, Identifiable, Sendable {
+    case fastVideoCall = "fast"
     case balancedANE = "balanced"
     case accurateMax = "accurate"
 
     public var id: String { rawValue }
     public var title: String {
         switch self {
-        case .balancedANE: return "Fast ANE + Guided Hair"
+        case .fastVideoCall: return "Ultra-Light (Calls) + Guided Hair"
+        case .balancedANE: return "Balanced ANE + Guided Hair"
         case .accurateMax: return "Max Neural + Guided Hair"
         }
     }
@@ -227,7 +229,7 @@ public final class StudioSettings: ObservableObject {
     @Published public var activeProfileID: String = "executive_call"
     // Default to Auto (Match Client) so 1080p Teams/Meet calls run natively at 1080p with zero 4K downsample!
     @Published public var resolution: CaptureResolutionPreset = .autoClient { didSet { syncSnapshot() } }
-    @Published public var segmentationQuality: SegmentationQualityPreset = .balancedANE { didSet { syncSnapshot() } }
+    @Published public var segmentationQuality: SegmentationQualityPreset = .fastVideoCall { didSet { syncSnapshot() } }
 
     @Published public var portraitEnabled: Bool = true { didSet { syncSnapshot() } }
     @Published public var portraitStrength: Float = 0.62 { didSet { syncSnapshot() } }
@@ -267,7 +269,7 @@ public final class StudioSettings: ObservableObject {
     @Published public var recentLUTURLs: [URL] = []
 
     @Published public var customUserProfile: StudioProfilePreset? = nil
-    @Published public var expandedRow: String? = "portrait"
+    @Published public var expandedRow: String? = "background"
     @Published public var isDropTargeted: Bool = false
 
     private nonisolated let storage: SnapshotStorage
@@ -276,7 +278,7 @@ public final class StudioSettings: ObservableObject {
         let grad = StudioGradientPreset.presets[0]
         self.storage = SnapshotStorage(RenderSettingsSnapshot(
             resolution: .autoClient,
-            segmentationQuality: .balancedANE,
+            segmentationQuality: .fastVideoCall,
             backgroundMode: .gradient,
             gradientPreset: grad,
             portraitEnabled: true,
@@ -407,7 +409,7 @@ public final class StudioSettings: ObservableObject {
     private func savePersisted() {
         let d = UserDefaults.standard
         d.set(resolution.rawValue, forKey: "sc.resolutionV2")
-        d.set(segmentationQuality.rawValue, forKey: "sc.segQuality")
+        d.set(segmentationQuality.rawValue, forKey: "sc.segQualityV2")
         d.set(portraitEnabled, forKey: "sc.portrait")
         d.set(portraitStrength, forKey: "sc.portraitStrength")
         d.set(depthBokehEnabled, forKey: "sc.depthBokeh")
@@ -439,7 +441,7 @@ public final class StudioSettings: ObservableObject {
     private func loadPersisted() {
         let d = UserDefaults.standard
         if let r = d.string(forKey: "sc.resolutionV2"), let p = CaptureResolutionPreset(rawValue: r) { resolution = p }
-        if let q = d.string(forKey: "sc.segQuality"), let p = SegmentationQualityPreset(rawValue: q) { segmentationQuality = p }
+        if let q = d.string(forKey: "sc.segQualityV2"), let p = SegmentationQualityPreset(rawValue: q) { segmentationQuality = p }
         if d.object(forKey: "sc.portrait") != nil { portraitEnabled = d.bool(forKey: "sc.portrait") }
         if d.object(forKey: "sc.portraitStrength") != nil { portraitStrength = d.float(forKey: "sc.portraitStrength") }
         if d.object(forKey: "sc.depthBokeh") != nil { depthBokehEnabled = d.bool(forKey: "sc.depthBokeh") }

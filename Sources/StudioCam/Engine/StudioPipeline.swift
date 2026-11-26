@@ -38,10 +38,28 @@ public final class StudioPipeline: NSObject, ObservableObject, @unchecked Sendab
     private let ringLight: ScreenRingLightController
 
     private let frameCallbackLock = NSLock()
-    private var _onFrameRendered: ((MTLTexture) -> Void)?
-    public var onFrameRendered: ((MTLTexture) -> Void)? {
-        get { frameCallbackLock.lock(); defer { frameCallbackLock.unlock() }; return _onFrameRendered }
-        set { frameCallbackLock.lock(); _onFrameRendered = newValue; frameCallbackLock.unlock() }
+    private var frameSubscribers: [UUID: (CVPixelBuffer) -> Void] = [:]
+
+    public func addFrameSubscriber(_ handler: @escaping (CVPixelBuffer) -> Void) -> () -> Void {
+        let id = UUID()
+        frameCallbackLock.lock()
+        frameSubscribers[id] = handler
+        frameCallbackLock.unlock()
+        return { [weak self] in
+            guard let self = self else { return }
+            self.frameCallbackLock.lock()
+            self.frameSubscribers.removeValue(forKey: id)
+            self.frameCallbackLock.unlock()
+        }
+    }
+
+    private func broadcastCompletedFrame(_ pixelBuffer: CVPixelBuffer) {
+        frameCallbackLock.lock()
+        let handlers = Array(frameSubscribers.values)
+        frameCallbackLock.unlock()
+        for h in handlers {
+            h(pixelBuffer)
+        }
     }
 
     private let captureQueue = DispatchQueue(label: "com.thetonegeek.studiocam.capture", qos: .userInteractive)
@@ -596,16 +614,21 @@ extension StudioPipeline: AVCaptureVideoDataOutputSampleBufferDelegate {
         let visionPB = compositor.makeVisionInputBuffer(from: camPB)
 
         if needsSegmentation || needsFace {
-            let desiredQuality: VNGeneratePersonSegmentationRequest.QualityLevel =
-                (snap.segmentationQuality == .accurateMax) ? .accurate : .balanced
+            let desiredQuality: VNGeneratePersonSegmentationRequest.QualityLevel
+            switch snap.segmentationQuality {
+            case .fastVideoCall: desiredQuality = .fast
+            case .balancedANE: desiredQuality = .balanced
+            case .accurateMax: desiredQuality = .accurate
+            }
             if segRequest.qualityLevel != desiredQuality {
                 segRequest.qualityLevel = desiredQuality
             }
 
             var requests: [VNRequest] = []
             if needsSegmentation { requests.append(segRequest) }
-            if needsFace && (frameIndex % 5 == 0) { requests.append(faceRequest) }
-            if snap.reactionsGestureEnabled && (frameIndex % 10 == 0) { requests.append(handRequest) }
+            // Run face tracking at 1.5 Hz (every 20 frames) instead of 6 Hz to avoid Vision CPU spikes!
+            if needsFace && (frameIndex % 20 == 1) { requests.append(faceRequest) }
+            if snap.reactionsGestureEnabled && (frameIndex % 15 == 1) { requests.append(handRequest) }
 
             if !requests.isEmpty {
                 let t0 = CACurrentMediaTime()
@@ -671,10 +694,11 @@ extension StudioPipeline: AVCaptureVideoDataOutputSampleBufferDelegate {
             cameraCropRect: camCropRect,
             settings: snap,
             produceSink: sinkActive,
-            sinkDimensions: sinkDims
+            sinkDimensions: sinkDims,
+            waitForGPUCompletion: true
         ) else { return }
 
-        onFrameRendered?(rendered.mainTexture)
+        broadcastCompletedFrame(rendered.mainPixelBuffer)
 
         if sinkActive, let sinkPB = rendered.sinkPixelBuffer {
             sinkBridge.enqueueFrame(sinkPB, fps: 30)
